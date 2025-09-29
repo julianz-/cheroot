@@ -1,4 +1,8 @@
 import io
+import sys
+
+if sys.platform == 'win32':
+    WSAENOTSOCK: int
 
 SOCK_WRITE_BLOCKSIZE: int
 
