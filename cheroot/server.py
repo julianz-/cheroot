@@ -80,6 +80,7 @@ import time
 import traceback as traceback_
 import urllib.parse
 from functools import lru_cache
+from warnings import warn as _warn
 
 from . import __version__, connections, errors
 from ._compat import IS_PPC, bton
@@ -1369,6 +1370,7 @@ class HTTPConnection:
             'this server only speaks HTTPS on this port.'
         )
         req.simple_response('400 Bad Request', msg)
+        self.wfile.flush()
         self.linger = True
 
     def _conditional_error(self, req, response):
@@ -1987,7 +1989,9 @@ class HTTPServer:
             type,
             proto,
             self.nodelay,
-            self.ssl_adapter,
+            # ssl_adapter is passed to HTTPServer, not needed here
+            # this parameter is deprecated and will be removed in future
+            None,
             self.reuse_port,
         )
         sock = self.socket = self.bind_socket(sock, self.bind_addr)
@@ -2115,7 +2119,25 @@ class HTTPServer:
         ssl_adapter,
         reuse_port=False,
     ):
-        """Create and prepare the socket object."""
+        """
+        Create and prepare the socket object.
+
+        :param ssl_adapter: Legacy SSL adapter parameter.
+            This argument is now ignored internally.
+
+        :deprecated ssl_adapter: This parameter is now deprecated and will be
+            removed in a future release. Pass the adapter to the 'HTTPServer`
+            constructor instead.
+        """
+        if ssl_adapter is not None:
+            _warn(
+                'The `ssl_adapter` parameter in `prepare_socket` is deprecated '
+                'and will be removed in a future version. Pass the adapter'
+                ' to the `HTTPServer` constructor instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         sock = socket.socket(family, type, proto)
         connections.prevent_socket_inheritance(sock)
 
@@ -2139,9 +2161,6 @@ class HTTPServer:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if nodelay and not isinstance(bind_addr, (str, bytes)):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        if ssl_adapter is not None:
-            sock = ssl_adapter.bind(sock)
 
         # If listening on the IPV6 any address ('::' = IN6ADDR_ANY),
         # activate dual-stack. See
