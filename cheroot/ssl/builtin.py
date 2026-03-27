@@ -43,37 +43,40 @@ def _assert_ssl_exc_contains(exc, *msgs):
     return any(m.lower() in err_msg_lower for m in msgs)
 
 
-def _loopback_for_cert_thread(context, server):
-    """Wrap a socket in ssl and perform the server-side handshake."""
-    # As we only care about parsing the certificate, the failure of
-    # which will cause an exception in ``_loopback_for_cert``,
-    # we can safely ignore connection and ssl related exceptions. Ref:
-    # https://github.com/cherrypy/cheroot/issues/302#issuecomment-662592030
-    with suppress(ssl.SSLError, OSError):
-        with context.wrap_socket(
-            server,
-            do_handshake_on_connect=True,
-            server_side=True,
-        ) as ssl_sock:
-            # in TLS 1.3 (Python 3.7+, OpenSSL 1.1.1+), the server
-            # sends the client session tickets that can be used to
-            # resume the TLS session on a new connection without
-            # performing the full handshake again. session tickets are
-            # sent as a post-handshake message at some _unspecified_
-            # time and thus a successful connection may be closed
-            # without the client having received the tickets.
-            # Unfortunately, on Windows (Python 3.8+), this is treated
-            # as an incomplete handshake on the server side and a
-            # ``ConnectionAbortedError`` is raised.
-            # TLS 1.3 support is still incomplete in Python 3.8;
-            # there is no way for the client to wait for tickets.
-            # While not necessary for retrieving the parsed certificate,
-            # we send a tiny bit of data over the connection in an
-            # attempt to give the server a chance to send the session
-            # tickets and close the connection cleanly.
-            # Note that, as this is essentially a race condition,
-            # the error may still occur ocasionally.
-            ssl_sock.send(b'0000')
+def _loopback_for_cert_thread(context, server, handshake_done):
+    """Thread target for loopback connection to parse a cert."""
+    ssl_sock = None
+    handshake_timeout = 5.0  # Prevent CI from hanging on handshake
+    try:
+        try:
+            ssl_sock = context.wrap_socket(
+                server,
+                do_handshake_on_connect=True,
+                server_side=True,
+            )
+            if ssl_sock:
+                with suppress(OSError):
+                    ssl_sock.send(b'0000')
+        except Exception as exc:
+            print(
+                f'Loopback thread handshake failed: {exc!r}',
+                file=sys.stderr,
+            )
+    finally:
+        if ssl_sock:
+            with suppress(OSError):
+                ssl_sock.close()
+
+        # 4. CRITICAL: Wait for main thread to finish its wrap attempt
+        # before we kill the raw server socket.
+        handshake_done.wait(timeout=handshake_timeout)
+        server.close()
+
+
+def _get_cert_from_ssl_sock(ssl_sock):
+    """Receive cert data from ssl socket and return parsed cert."""
+    ssl_sock.recv(4)
+    return ssl_sock.getpeercert()
 
 
 def _loopback_for_cert(
@@ -84,7 +87,12 @@ def _loopback_for_cert(
     private_key_password=None,
 ):
     """Create a loopback connection to parse a cert with a private key."""
-    context = ssl.create_default_context(cafile=certificate_chain)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    # 2. Add the CA file if provided
+    if certificate_chain:
+        context.load_verify_locations(cafile=certificate_chain)
+
     context.load_cert_chain(
         certificate,
         private_key,
@@ -94,30 +102,43 @@ def _loopback_for_cert(
     context.verify_mode = ssl.CERT_NONE
 
     # Python 3+ Unix, Python 3.5+ Windows
+    socket_timeout = 2.0  # Prevent CI from hanging on handshake
+    # Ensure thread has time to finish after handshake timeout
+    thread_timeout = socket_timeout + 1.0
     client, server = socket.socketpair()
+    client.settimeout(socket_timeout)  # Prevent CI from hanging on handshake
+    server.settimeout(socket_timeout)
+
+    handshake_done = threading.Event()
+    thread = threading.Thread(
+        target=_loopback_for_cert_thread,
+        args=(context, server, handshake_done),
+    )
+
+    thread.start()
+
+    ssl_sock = None
+
     try:
-        # `wrap_socket` will block until the ssl handshake is complete.
-        # it must be called on both ends at the same time -> thread
-        # openssl will cache the peer's cert during a successful handshake
-        # and return it via `getpeercert` even after the socket is closed.
-        # when `close` is called, the SSL shutdown notice will be sent
-        # and then python will wait to receive the corollary shutdown.
-        thread = threading.Thread(
-            target=_loopback_for_cert_thread,
-            args=(context, server),
-        )
         try:
-            thread.start()
-            with context.wrap_socket(
+            ssl_sock = context.wrap_socket(
                 client,
                 do_handshake_on_connect=True,
                 server_side=False,
-            ) as ssl_sock:
-                ssl_sock.recv(4)
-                return ssl_sock.getpeercert()
+            )
+            return _get_cert_from_ssl_sock(ssl_sock)
         finally:
-            thread.join()
+            if ssl_sock:
+                with suppress(OSError):
+                    ssl_sock.close()
     finally:
+        # 1. Signal the thread that the main thread is exiting its wrap attempt
+        handshake_done.set()
+
+        # 2. Wait for thread to finish BEFORE closing ANY raw sockets
+        thread.join(timeout=thread_timeout)
+
+        # 3. Final cleanup of transport layer
         client.close()
         server.close()
 
@@ -322,10 +343,19 @@ class BuiltinSSLAdapter(Adapter):
             ssl.SSLEOFError,
             ssl.SSLZeroReturnError,
         ) as tls_connection_drop_error:
+            print(
+                f'builtin wrap raising FatalSSLAlert: {tls_connection_drop_error}',
+                file=sys.stderr,
+            )
+            sock.close()
             raise errors.FatalSSLAlert(
                 *tls_connection_drop_error.args,
             ) from tls_connection_drop_error
         except ssl.SSLError as generic_tls_error:
+            print(
+                f'builtin wrap SSLError: {generic_tls_error}',
+                file=sys.stderr,
+            )
             peer_speaks_plain_http_over_https = (
                 generic_tls_error.errno == ssl.SSL_ERROR_SSL
                 and _assert_ssl_exc_contains(generic_tls_error, 'http request')
@@ -335,10 +365,16 @@ class BuiltinSSLAdapter(Adapter):
             else:
                 reraised_connection_drop_exc_cls = errors.FatalSSLAlert
 
+            sock.close()
             raise reraised_connection_drop_exc_cls(
                 *generic_tls_error.args,
             ) from generic_tls_error
         except OSError as tcp_connection_drop_error:
+            print(
+                f'builtin wrap OSError: {tcp_connection_drop_error}',
+                file=sys.stderr,
+            )
+            sock.close()
             raise errors.FatalSSLAlert(
                 *tcp_connection_drop_error.args,
             ) from tcp_connection_drop_error

@@ -32,6 +32,12 @@ class BufferedWriter(io.BufferedWriter):
                 n = self.raw.write(bytes(self._write_buf))
             except io.BlockingIOError as e:
                 n = e.characters_written
+            except (OSError, ValueError):
+                # Python 3.14+: If the underlying socket was closed
+                # before this makefile wrapper is GC'd, flushing will fail.
+                # We clear the buffer to allow the object to die quietly.
+                self._write_buf.clear()
+                break
             del self._write_buf[:n]
 
 

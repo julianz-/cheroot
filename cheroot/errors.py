@@ -65,12 +65,17 @@ if sys.platform == 'darwin':
     socket_errors_nonblocking.extend(plat_specific_errors('EPROTOTYPE'))
 
 
-acceptable_sock_shutdown_error_codes = {
-    errno.ENOTCONN,
-    errno.EPIPE,
-    errno.ESHUTDOWN,  # corresponds to BrokenPipeError in Python 3
-    errno.ECONNRESET,  # corresponds to ConnectionResetError in Python 3
-}
+acceptable_sock_shutdown_error_codes = set(
+    plat_specific_errors(
+        'EBADF',
+        'ENOTCONN',
+        'EPIPE',
+        'ESHUTDOWN',
+        'ECONNRESET',
+        'WSAENOTSOCK',
+        'WSAEBADF',
+    ),
+)
 """Errors that may happen during the connection close sequence.
 
 * ENOTCONN — client is no longer connected

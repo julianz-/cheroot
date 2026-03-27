@@ -4,6 +4,7 @@ import contextlib as _cm
 import os
 import selectors
 import socket
+import sys
 import threading
 import time
 from http import HTTPStatus as _HTTPStatus
@@ -298,6 +299,7 @@ class ConnectionManager:
     def _from_server_socket(self, server_socket):  # noqa: C901  # FIXME
         try:
             s, addr = server_socket.accept()
+            print(f'accepted: fd={s.fileno()}, addr={addr}', file=sys.stderr)
             if self.server.stats['Enabled']:
                 self.server.stats['Accepts'] += 1
             prevent_socket_inheritance(s)
@@ -311,11 +313,25 @@ class ConnectionManager:
                 # FIXME: WPS505 -- too many nested blocks
                 try:  # noqa: WPS505
                     s, ssl_env = self.server.ssl_adapter.wrap(s)
+                    print(
+                        f'wrap succeeded: {type(s)}, {addr}',
+                        file=sys.stderr,
+                    )
                 except errors.FatalSSLAlert as tls_connection_drop_error:
+                    print(
+                        f'FatalSSLAlert in _from_server_socket: {type(s)}, fd={s.fileno()}, args={tls_connection_drop_error.args}',
+                        file=sys.stderr,
+                    )
                     self.server.error_log(
                         f'Client {addr!s} lost — peer dropped the TLS '
                         'connection suddenly, during handshake: '
                         f'{tls_connection_drop_error!s}',
+                    )
+                    with _cm.suppress(OSError):
+                        s.close()
+                    print(
+                        'after s.close() in FatalSSLAlert handler',
+                        file=sys.stderr,
                     )
                     return None
                 except errors.NoSSLError as http_over_https_err:
@@ -326,6 +342,8 @@ class ConnectionManager:
                         f'{http_over_https_err!s}',
                     )
                     self._send_bad_request_plain_http_error(s)
+                    with _cm.suppress(OSError):
+                        s.close()
                     return None
                 mf = self.server.ssl_adapter.makefile
                 # Re-apply our timeout since we may have a new socket object
@@ -333,6 +351,19 @@ class ConnectionManager:
                     s.settimeout(self.server.timeout)
 
             conn = self.server.ConnectionClass(self.server, s, mf)
+
+            with self.server._active_conn_lock:
+                conn._registered = True
+                self.server._active_conn_count += 1
+                self.server._no_active_connections.clear()
+
+            server_id = id(self.server)
+            fd = s.fileno()
+            count = self.server._active_conn_count
+            print(
+                f'[server {server_id}] new conn fd={fd}, addr={addr}, count={count}',
+                file=sys.stderr,
+            )
 
             if not isinstance(self.server.bind_addr, (str, bytes)):
                 # optional values
@@ -359,6 +390,8 @@ class ConnectionManager:
         except OSError as ex:
             if self.server.stats['Enabled']:
                 self.server.stats['Socket Errors'] += 1
+            with _cm.suppress(OSError):
+                s.close()
             if ex.args[0] in errors.socket_error_eintr:
                 # I *think* this is right. EINTR should occur when a signal
                 # is received during the accept() call; all docs say retry
@@ -380,8 +413,17 @@ class ConnectionManager:
     def close(self):
         """Close all monitored connections."""
         for _, conn in self._selector.connections:
-            if conn is not self.server:  # server closes its own socket
-                conn.close()
+            print(f'close(): found connection: {conn.socket}', file=sys.stderr)
+            if conn is not self.server:
+                server_id = id(self.server)
+                sock = conn.socket
+                fd = sock.fileno() if sock else None
+                has_socket = hasattr(sock, '_socket')
+                print(
+                    f'[server {server_id}]: closing conn fd={fd}: {sock}, has _socket={has_socket}',
+                    file=sys.stderr,
+                )
+                self.server._release_conn(conn, keep_open=False)
         self._selector.close()
 
     @property

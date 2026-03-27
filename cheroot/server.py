@@ -194,6 +194,8 @@ comma_separated_headers = [
 ]
 
 
+logger = logging.getLogger(__name__)
+
 if not hasattr(logging, 'statistics'):
     logging.statistics = {}
 
@@ -1290,6 +1292,7 @@ class HTTPConnection:
         self.rfile = makefile(sock, 'rb', self.rbufsize)
         self.wfile = makefile(sock, 'wb', self.wbufsize)
         self.requests_seen = 0
+        self._registered = False
 
         self.peercreds_enabled = self.server.peercreds_enabled
         self.peercreds_resolve_enabled = self.server.peercreds_resolve_enabled
@@ -1341,7 +1344,20 @@ class HTTPConnection:
         except (KeyboardInterrupt, SystemExit):
             raise
         except errors.FatalSSLAlert:
-            pass
+            # builtin adapter already closes the socket
+            # if the hadnshake fails in wrap(). pyopenssl
+            # defers the handshake until the first read/write,
+            # so we have to do it here.
+            print(
+                f'FatalSSLAlert: socket type={type(self.socket)}, has _socket={hasattr(self.socket, "_socket")}',
+                file=sys.stderr,
+            )
+            if hasattr(self.socket, '_socket'):
+                with contextlib.suppress(OSError):
+                    self.socket.close()  # close SSLConnection first
+                with contextlib.suppress(OSError):
+                    self.socket._socket.close()  # then force close raw socket
+                # self.socket = None  # prevent double-close in WorkerThread
         except errors.NoSSLError:
             self._handle_no_ssl(req)
         except Exception as ex:
@@ -1370,7 +1386,15 @@ class HTTPConnection:
             'this server only speaks HTTPS on this port.'
         )
         req.simple_response('400 Bad Request', msg)
-        self.linger = True
+        # Give client 1s to read the response then force close
+        try:
+            self.socket.settimeout(1)
+            data = self.socket.recv(1024)
+            while data:
+                data = self.socket.recv(1024)
+        except OSError:
+            pass
+        self.linger = False
 
     def _conditional_error(self, req, response):
         """Respond with an error.
@@ -1388,24 +1412,29 @@ class HTTPConnection:
         except errors.NoSSLError:
             self._handle_no_ssl(req)
 
+    def _close_socket(self):
+        """Close the underlying socket and any SSL wrapper."""
+        if self.socket is None:
+            return
+        try:  # noqa: WPS501
+            self._close_kernel_socket()
+        finally:
+            self.socket.close()
+            if hasattr(self.socket, '_socket'):
+                try:
+                    self.socket._socket.close()
+                except OSError as e:
+                    print(f'OSError closing _socket: {e}', file=sys.stderr)
+
     def close(self):
         """Close the socket underlying this connection."""
-        self.rfile.close()
-
-        if not self.linger:
-            self._close_kernel_socket()
-            # close the socket file descriptor
-            # (will be closed in the OS if there is no
-            # other reference to the underlying socket)
-            self.socket.close()
-        else:
-            # On the other hand, sometimes we want to hang around for a bit
-            # to make sure the client has a chance to read our entire
-            # response. Skipping the close() calls here delays the FIN
-            # packet until the socket object is garbage-collected later.
-            # Someday, perhaps, we'll do the full lingering_close that
-            # Apache does, but not today.
-            pass
+        try:  # noqa: WPS501
+            self.rfile.close()
+            self.wfile.close()
+        finally:
+            self._unregister()
+            if not self.linger:
+                self._close_socket()
 
     def get_peer_creds(self):  # LRU cached on per-instance basis, see __init__
         """Return the PID/UID/GID tuple of the peer socket for UNIX sockets.
@@ -1514,13 +1543,33 @@ class HTTPConnection:
             self.socket.shutdown,
         )
 
+        print(
+            f'_close_kernel_socket: calling shutdown on {self.socket}',
+            file=sys.stderr,
+        )
         try:
-            shutdown(socket.SHUT_RDWR)  # actually send a TCP FIN
+            shutdown(socket.SHUT_RDWR)
+            print('_close_kernel_socket: shutdown complete', file=sys.stderr)
         except errors.acceptable_sock_shutdown_exceptions:
-            pass
+            print(
+                '_close_kernel_socket: acceptable exception',
+                file=sys.stderr,
+            )
         except socket.error as e:
+            print(f'_close_kernel_socket: socket.error {e}', file=sys.stderr)
             if e.errno not in errors.acceptable_sock_shutdown_error_codes:
                 raise
+
+    def _unregister(self):
+        """Unregister this connection from the server's active count, once only."""
+        if not self._registered:
+            return
+        self._registered = False
+        with self.server._active_conn_lock:
+            if self.server._active_conn_count > 0:
+                self.server._active_conn_count -= 1
+            if self.server._active_conn_count == 0:
+                self.server._no_active_connections.set()
 
 
 class HTTPServer:
@@ -1650,6 +1699,13 @@ class HTTPServer:
             min=minthreads or 1,
             max=maxthreads,
         )
+
+        # keep track of active connections so we know when we
+        # can close them on shutdown
+        self._active_conn_count = 0
+        self._active_conn_lock = threading.Lock()
+        self._no_active_connections = threading.Event()
+        self._no_active_connections.set()  # starts as "no active connections"
 
         if not server_name:
             server_name = self.version
@@ -1789,12 +1845,14 @@ class HTTPServer:
             underlying_interrupt = self.interrupt
             if not underlying_interrupt:
                 self.interrupt = kb_intr_exc
-            raise kb_intr_exc from underlying_interrupt
+                raise kb_intr_exc from underlying_interrupt
         except SystemExit as sys_exit_exc:
             underlying_interrupt = self.interrupt
             if not underlying_interrupt:
                 self.interrupt = sys_exit_exc
-            raise sys_exit_exc from underlying_interrupt
+                raise sys_exit_exc from underlying_interrupt
+        except BaseException:  # noqa: S110
+            pass  # already logged and handled in WorkerThread.run()
 
     def prepare(self):  # noqa: C901  # FIXME
         """Prepare server to serving requests.
@@ -1871,6 +1929,18 @@ class HTTPServer:
         self.ready = True
         self._start_time = time.time()
 
+    def _close_unservicable_conn(self, conn):
+        """Close a 503 connection, giving the client 1s to read the response."""
+        try:
+            conn.socket.settimeout(1)
+            data = conn.socket.recv(1024)
+            while data:
+                data = conn.socket.recv(1024)
+        except OSError:
+            pass
+        conn.linger = False
+        conn.close()
+
     def _serve_unservicable(self):
         """Serve connections we can't handle a 503."""
         while self.ready:
@@ -1893,8 +1963,8 @@ class HTTPServer:
                     level=logging.ERROR,
                     traceback=True,
                 )
-            conn.linger = True
-            conn.close()
+            finally:
+                self._close_unservicable_conn(conn)
 
     def serve(self):
         """Serve requests, after invoking :func:`prepare()`."""
@@ -1906,8 +1976,10 @@ class HTTPServer:
         while self.ready and not self.interrupt:
             try:
                 self._connections.run(self.expiration_interval)
-            except (KeyboardInterrupt, SystemExit):
-                raise
+            except (KeyboardInterrupt, SystemExit) as exc:
+                if not self.interrupt:
+                    self._interrupt = exc
+                return  # exit serve() cleanly without raising
             except Exception:
                 self.error_log(
                     'Error in HTTPServer.serve',
@@ -1953,12 +2025,19 @@ class HTTPServer:
         return self.ready and self._connections.can_add_keepalive_connection
 
     def put_conn(self, conn):
-        """Put an idle connection back into the ConnectionManager."""
-        if self.ready:
-            self._connections.put(conn)
-        else:
-            # server is shutting down, just close it
-            conn.close()
+        """Put an idle connection back into the ConnectionManager.
+
+        .. deprecated::
+            Use internal connection management instead.
+        """
+        import warnings
+
+        warnings.warn(
+            'put_conn is deprecated and will be removed in a future version.',
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._release_conn(conn, keep_open=True)
 
     def error_log(self, msg='', level=20, traceback=False):
         """Write error message to log.
@@ -2243,38 +2322,34 @@ class HTTPServer:
 
     def stop(self):  # noqa: C901  # FIXME
         """Gracefully shutdown a server that is serving forever."""
+        logger.warning('STOP CALLED: ready=%s', self.ready)
+
         if not self.ready:
             return  # already stopped
 
+        # Prevent other threads from re-running stop()
         self.ready = False
 
-        # This tells the thread that handles unservicable connections to shut
-        # down:
+        # Tell the thread that handles unservicable connections to shut down:
         self._unservicable_conns.put(_STOPPING_FOR_INTERRUPT)
 
         if self._start_time is not None:
             self._run_time += time.time() - self._start_time
         self._start_time = None
 
-        self._connections.stop()
+        if self._connections is not None:
+            self._connections.stop()
+            print('stop(): connections.stop() complete', file=sys.stderr)
 
         sock = getattr(self, 'socket', None)
         if sock:
             if not isinstance(self.bind_addr, (str, bytes)):
-                # Touch our own socket to make accept() return immediately.
                 try:
                     host, port = sock.getsockname()[:2]
                 except socket.error as ex:
                     if ex.args[0] not in errors.socket_errors_to_ignore:
-                        # Changed to use error code and not message
-                        # See
-                        # https://github.com/cherrypy/cherrypy/issues/860.
                         raise
                 else:
-                    # Note that we're explicitly NOT using AI_PASSIVE,
-                    # here, because we want an actual IP to touch.
-                    # localhost won't work if we've bound to a public IP,
-                    # but it will if we bound to '0.0.0.0' (INADDR_ANY).
                     for res in socket.getaddrinfo(
                         host,
                         port,
@@ -2283,23 +2358,102 @@ class HTTPServer:
                     ):
                         af, socktype, proto, _canonname, _sa = res
                         s = None
+
                         try:
                             s = socket.socket(af, socktype, proto)
-                            # See
-                            # https://groups.google.com/group/cherrypy-users/
-                            #     browse_frm/thread/bbfe5eb39c904fe0
-                            s.settimeout(1.0)
-                            s.connect((host, port))
-                            s.close()
-                        except socket.error:
-                            if s:
-                                s.close()
+                            fd = s.fileno()
+                            print(
+                                f'touch socket created: fd={fd}, af={af}',
+                                file=sys.stderr,
+                            )
+                            with s:
+                                s.settimeout(1.0)
+                                s.connect((host, port))
+
+                            print(
+                                f'touch socket closed: fd={fd}, af={af}',
+                                file=sys.stderr,
+                            )
+                            break  # one successful touch is enough
+                        except socket.error as err:
+                            print(
+                                f'touch socket error: {err!r}, af={af}',
+                                file=sys.stderr,
+                            )
             if hasattr(sock, 'close'):
                 sock.close()
+                print('stop(): server socket closed', file=sys.stderr)
             self.socket = None
 
-        self._connections.close()
-        self.requests.stop(self.shutdown_timeout)
+        if self._connections is not None:
+            self._connections.close()  # close idle connections
+            print('stop(): connections.close() complete', file=sys.stderr)
+
+        if hasattr(self, 'requests') and self.requests:
+            print(
+                f'stop(): stopping requests with timeout={self.shutdown_timeout}',
+                file=sys.stderr,
+            )
+            self.requests.stop(self.shutdown_timeout)
+            print('stop(): requests stopped', file=sys.stderr)
+
+        if self._active_conn_count > 0:
+            print(
+                f'[server {id(self)}] waiting for workers to finish processing '
+                f'active_conn_count is {self._active_conn_count}',
+                file=sys.stderr,
+            )
+            self._no_active_connections.wait(timeout=1.0)
+            print(
+                'active connections is now: '
+                f'{self._active_conn_count} remaining.',
+            )
+
+        connection_manager = self._connections
+        if connection_manager is not None:
+            for attr_name in ('_connections', 'connections'):
+                coll = getattr(connection_manager, attr_name, None)
+                if hasattr(coll, 'clear'):
+                    print(
+                        f'Clearing collection {attr_name} in connection manager',
+                    )
+                    coll.clear()
+
+        print('stop(): complete', file=sys.stderr)
+        self._connections = None
+        self.requests = None
+        self.socket = None
+
+    def _release_conn(self, conn, keep_open):
+        """Release a connection back to the pool or close it."""
+        print(
+            f'[server {id(self)}]'
+            f'_release_conn: keep_open={keep_open}, ready={self.ready}, count={self._active_conn_count}',
+            file=sys.stderr,
+        )
+        if keep_open and self.ready:
+            try:
+                self._connections.put(conn)
+                print(
+                    f'_release_conn: put back in selector, count stays at {self._active_conn_count}',
+                    file=sys.stderr,
+                )
+                return
+            except ValueError:
+                pass
+        print(
+            f'_release_conn: closed, count={self._active_conn_count}',
+            file=sys.stderr,
+        )
+        try:
+            conn.close()
+            print('_release_conn: conn.close() complete', file=sys.stderr)
+        except Exception as e:
+            print(
+                f'Error while closing connection: {e}',
+                file=sys.stderr,
+            )
+            raise
 
 
 class Gateway:

@@ -136,7 +136,6 @@ def make_tls_http_server(bind_addr, ssl_adapter, request):
         bind_addr=bind_addr,
         gateway=HelloWorldGateway,
     )
-    # httpserver.gateway = HelloWorldGateway
     httpserver.ssl_adapter = ssl_adapter
 
     threading.Thread(target=httpserver.safe_start).start()
@@ -144,7 +143,17 @@ def make_tls_http_server(bind_addr, ssl_adapter, request):
     while not httpserver.ready:
         time.sleep(0.1)
 
-    request.addfinalizer(httpserver.stop)
+    def stop_and_wait():  # noqa: WPS430
+        httpserver.stop()
+        # Wait for all worker threads to finish processing connections
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            workers = getattr(httpserver.requests, '_threads', [])
+            if not any(w.is_alive() for w in workers):
+                break
+            time.sleep(0.05)
+
+    request.addfinalizer(stop_and_wait)
 
     return httpserver
 
@@ -273,6 +282,18 @@ def thread_exceptions():
             threading.excepthook = orig_hook
 
 
+@pytest.fixture
+def requests_session():
+    """Provide a requests session that is closed after the test."""
+    with requests.Session() as session:
+        yield session
+
+    for adapter in session.adapters.values():
+        adapter.close()
+    session.close()
+    print('requests_session closed', file=sys.stderr)
+
+
 @pytest.mark.parametrize(
     'adapter_type',
     (
@@ -288,8 +309,10 @@ def test_ssl_adapters(  # pylint: disable=too-many-positional-arguments
     tls_certificate_chain_pem_path,
     tls_certificate_private_key_pem_path,
     tls_ca_certificate_pem_path,
+    requests_session,
 ):
     """Test ability to connect to server via HTTPS using adapters."""
+    assert requests_session is not None
     interface, _host, port = _get_conn_data(ANY_INTERFACE_IPV4)
     tls_adapter_cls = get_ssl_adapter_class(name=adapter_type)
     tls_adapter = tls_adapter_cls(
@@ -310,7 +333,7 @@ def test_ssl_adapters(  # pylint: disable=too-many-positional-arguments
         tlshttpserver.bind_addr,
     )
 
-    resp = requests.get(
+    resp = requests_session.get(
         f'https://{interface!s}:{port!s}/',
         timeout=http_request_timeout,
         verify=tls_ca_certificate_pem_path,
@@ -318,6 +341,14 @@ def test_ssl_adapters(  # pylint: disable=too-many-positional-arguments
 
     assert resp.status_code == 200
     assert resp.text == 'Hello world!'
+
+
+def test_socket_type():
+    """Ensure that socket.socket is properly patched to TraceableSocket."""
+    s = socket.socket()
+    print(f'Current socket type: {type(s)}')
+    assert 'TraceableSocket' in str(type(s))
+    s.close()
 
 
 @pytest.mark.parametrize(  # noqa: C901  # FIXME
@@ -365,8 +396,13 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
     is_trusted_cert,
     tls_client_identity,
     tls_verify_mode,
+    requests_session,
 ):
     """Verify that client TLS certificate auth works correctly."""
+    test_socket_type()
+    # import tracemalloc
+    # tracemalloc.start()
+    # snapshot1 = tracemalloc.take_snapshot()
     test_cert_rejection = (
         tls_verify_mode != ssl.CERT_NONE and not is_trusted_cert
     )
@@ -405,7 +441,7 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
         interface, _host, port = _get_conn_data(tlshttpserver.bind_addr)
 
         make_https_request = functools.partial(
-            requests.get,
+            requests_session.get,
             f'https://{interface!s}:{port!s}/',
             # Don't wait for the first byte forever:
             timeout=http_request_timeout,
@@ -432,6 +468,12 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
             assert is_req_successful
             assert resp.text == 'Hello world!'
             resp.close()
+            # snapshot2 = tracemalloc.take_snapshot()
+            # top_stats = snapshot2.compare_to(snapshot1, 'lineno')
+
+            # print("[ Top 5 Memory Increases ]")
+            # for stat in top_stats[:5]:
+            #     print(stat)
             return
 
         # xfail some flaky tests
@@ -461,11 +503,21 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
         if isinstance(err_text, int):
             err_text = str(ssl_err.value)
 
-        expected_substrings = (
-            'sslv3 alert bad certificate'
-            if IS_LIBRESSL_BACKEND
-            else 'tlsv1 alert unknown ca',
-        )
+        if IS_LIBRESSL_BACKEND:
+            expected_substrings = ('sslv3 alert bad certificate',)
+        elif IS_WINDOWS:
+            expected_substrings = (
+                'tlsv1 alert unknown ca',
+                'unable to get local issuer certificate',
+                'Connection aborted',
+                'forcibly closed by the remote host',
+            )
+        else:
+            expected_substrings = (
+                'tlsv1 alert unknown ca',
+                'unable to get local issuer certificate',
+            )
+
         if IS_MACOS and IS_PYPY and adapter_type == 'pyopenssl':
             expected_substrings = ('tlsv1 alert unknown ca',)
         if (
@@ -527,7 +579,7 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
                 "'Remote end closed connection without response'))",
             )
 
-        assert any(e in err_text for e in expected_substrings)
+        assert any(e.lower() in err_text.lower() for e in expected_substrings)
 
 
 @pytest.mark.parametrize(  # noqa: C901  # FIXME

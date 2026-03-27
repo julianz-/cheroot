@@ -1,5 +1,6 @@
 """Tests for the HTTP server."""
 
+import contextlib
 import os
 import pathlib
 import queue
@@ -8,10 +9,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import urllib.parse  # noqa: WPS301
 import uuid
-from http import HTTPStatus
+from http import (
+    HTTPStatus,
+)
 
 import pytest
 
@@ -103,7 +107,8 @@ def test_prepare_makes_server_ready():
 
     httpserver.stop()
 
-    assert not httpserver.requests._threads
+    requests = getattr(httpserver, 'requests', None)
+    assert not (requests and requests._threads)
     assert not httpserver.ready
 
 
@@ -353,37 +358,75 @@ def test_peercreds_unix_sock_with_lookup(
     indirect=('resource_limit',),
 )
 @pytest.mark.usefixtures('many_open_sockets')
-def test_high_number_of_file_descriptors(native_server_client, resource_limit):
+def test_high_number_of_file_descriptors(native_server_client, resource_limit):  # noqa: WPS231
     """Test the server does not crash with a high file-descriptor value.
 
     This test shouldn't cause a server crash when trying to access
     file-descriptor higher than 1024.
 
-    The earlier implementation used to rely on ``select()`` syscall that
+    Earlier implementations relied on the ``select()`` syscall that
     doesn't support file descriptors with numbers higher than 1024.
     """
     # We want to force the server to use a file-descriptor with
     # a number above resource_limit
 
-    # Patch the method that processes
+    # Patch the method that processes connections
+    # so we can check the file descriptors of the sockets it creates.
     _old_process_conn = native_server_client.server_instance.process_conn
+    lock = threading.Lock()
 
     def native_process_conn(conn):
-        native_process_conn.filenos.add(conn.socket.fileno())
+        with lock:
+            native_process_conn.filenos.add(conn.socket.fileno())
         return _old_process_conn(conn)
 
     native_process_conn.filenos = set()
     native_server_client.server_instance.process_conn = native_process_conn
 
-    # Trigger a crash if select() is used in the implementation
-    native_server_client.connect('/')
+    try:  # noqa: WPS243
+        # Make a request so the server accepts a connection on a high fd
+        # number. This test ensures the server's connection manager uses a
+        # native syscall (poll, epoll, kqueue) rather than the legacy select(),
+        # which would silently break for any socket fd >= 1024.
+        native_server_client.connect('/')
 
-    # Ensure that at least one connection got accepted, otherwise the
-    # follow-up check wouldn't make sense
-    assert len(native_process_conn.filenos) > 0
+        # Give the server thread time to actually call process_conn
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            with lock:
+                if native_process_conn.filenos:
+                    break
+            time.sleep(0.05)
 
-    # Check at least one of the sockets created are above the target number
-    assert any(fn >= resource_limit for fn in native_process_conn.filenos)
+        # Ensure that at least one connection got accepted, otherwise the
+        # follow-up check wouldn't make sense
+        assert len(native_process_conn.filenos) > 0
+
+        # Check at least one of the sockets created are above the target number
+        assert any(fn >= resource_limit for fn in native_process_conn.filenos)
+    finally:
+        native_server_client.server_instance.process_conn = _old_process_conn
+
+        # Close the client-side socket explicitly. Python 3.14 promotes
+        # ResourceWarning to an error during pytest teardown - which
+        # it does by setting funcargs = None.
+        # So we close here rather than relying on GC.
+        http_conn = getattr(native_server_client, '_http_connection', None)
+        if http_conn is not None:
+            sock = getattr(http_conn, 'sock', None)
+            if sock is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    sock.shutdown(socket.SHUT_RDWR)
+
+                with contextlib.suppress(OSError, ValueError):
+                    sock.close()
+
+                http_conn.sock = None
+
+            with contextlib.suppress(OSError, ValueError):
+                http_conn.close()
+
+        native_process_conn.filenos.clear()
 
 
 @pytest.mark.skipif(

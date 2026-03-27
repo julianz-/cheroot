@@ -1,7 +1,9 @@
 """Pytest fixtures and other helpers for doing testing by end-users."""
 
 import errno
+import gc
 import http.client
+import logging
 import socket
 import threading
 import time
@@ -23,6 +25,8 @@ ANY_INTERFACE_IPV6 = '::'
 # the test doesn't acidentally pass:
 SUCCESSFUL_SUBPROCESS_EXIT = 23
 
+logger = logging.getLogger(__name__)
+
 config = {
     cheroot.wsgi.Server: {
         'bind_addr': (NO_INTERFACE, EPHEMERAL_PORT),
@@ -35,8 +39,25 @@ config = {
 }
 
 
+def _cleanup_server(httpserver, server_thread):
+    import sys
+
+    print('_cleanup_server: calling stop()', file=sys.stderr)
+    httpserver.stop()
+    print('_cleanup_server: stop() complete, joining thread', file=sys.stderr)
+    server_thread.join(timeout=10)
+    if server_thread.is_alive():
+        print(
+            '_cleanup_server: thread still alive after 10s!',
+            file=sys.stderr,
+        )
+    else:
+        print('_cleanup_server: thread joined', file=sys.stderr)
+    gc.collect()
+
+
 @contextmanager
-def cheroot_server(server_factory):  # noqa: WPS210
+def cheroot_server(server_factory):  # noqa: WPS210, WPS231
     """Set up and tear down a Cheroot server instance."""
     conf = config[server_factory].copy()
     bind_port = conf.pop('bind_addr')[-1]
@@ -58,6 +79,7 @@ def cheroot_server(server_factory):  # noqa: WPS210
     # FIXME: Expose this thread through a fixture so that it
     # FIXME: could be awaited in tests.
     server_thread = threading.Thread(target=httpserver.safe_start)
+    # server_thread.daemon = True
     server_thread.start()  # spawn it
     while not httpserver.ready:  # wait until fully initialized and bound
         time.sleep(0.1)
@@ -65,8 +87,7 @@ def cheroot_server(server_factory):  # noqa: WPS210
     try:
         yield server_thread, httpserver
     finally:
-        httpserver.stop()  # destroy it
-        server_thread.join()  # wait for the thread to be turn down
+        _cleanup_server(httpserver, server_thread)
 
 
 @pytest.fixture

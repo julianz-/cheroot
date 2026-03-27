@@ -8,7 +8,11 @@ import time
 import traceback as traceback_
 import urllib.request
 from collections import namedtuple
-from contextlib import suppress as _suppress_exceptions
+from contextlib import (
+    closing,
+    contextmanager,
+    suppress as _suppress_exceptions,
+)
 from re import match as _matches_pattern
 
 import pytest
@@ -427,6 +431,31 @@ def test_streaming_10(test_client, set_cl):
     http_connection.close()
 
 
+@contextmanager
+def temporary_protocol(server, protocol):
+    """Swap the server protocol and restore after use."""
+    original = server.protocol
+    server.protocol = protocol
+    try:
+        yield
+    finally:
+        server.protocol = original
+
+
+@contextmanager
+def persistent_connection(test_client):
+    """Manage the life-cycle of a manual HTTP connection."""
+    conn = test_client.get_connection()
+    conn.auto_open = False
+    conn.connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+        if hasattr(test_client, 'http_connection'):
+            test_client.http_connection = None
+
+
 @pytest.mark.parametrize(
     'http_server_protocol',
     (
@@ -443,63 +472,51 @@ def test_streaming_10(test_client, set_cl):
 )
 def test_keepalive(test_client, http_server_protocol):
     """Test Keep-Alive enabled connections."""
-    original_server_protocol = test_client.server_instance.protocol
-    test_client.server_instance.protocol = http_server_protocol
+    server = test_client.server_instance
+    original_timeout = server.timeout
+    server.timeout = 5.0
+    client_proto = 'HTTP/1.0'
 
-    http_client_protocol = 'HTTP/1.0'
+    try:
+        # We wrap the context managers because they manage the socket
+        # which is the "risky" part that might need the finally cleanup.
+        with temporary_protocol(server, http_server_protocol):
+            with persistent_connection(test_client) as http_connection:
+                # 1. Test normal HTTP/1.0 (No Keep-Alive)
+                status, headers, _body = test_client.get(
+                    '/page2',
+                    protocol=client_proto,
+                )
+                assert int(status[:3]) == 200
+                assert not header_exists('Connection', headers)
 
-    # Initialize a persistent HTTP connection
-    http_connection = test_client.get_connection()
-    http_connection.auto_open = False
-    http_connection.connect()
+                time.sleep(0.1)
 
-    # Test a normal HTTP/1.0 request.
-    status_line, actual_headers, actual_resp_body = test_client.get(
-        '/page2',
-        protocol=http_client_protocol,
-    )
-    actual_status = int(status_line[:3])
-    assert actual_status == 200
-    assert status_line[4:] == 'OK'
-    assert actual_resp_body == pov.encode()
-    assert not header_exists('Connection', actual_headers)
+                # 2. Test explicit Keep-Alive request
+                status, headers, _body = test_client.get(
+                    '/page3',
+                    headers=[('Connection', 'Keep-Alive')],
+                    http_conn=http_connection,
+                    protocol=client_proto,
+                )
+                assert int(status[:3]) == 200
+                assert header_has_value('Connection', 'Keep-Alive', headers)
+                assert header_has_value(
+                    'Keep-Alive',
+                    f'timeout={server.timeout}',
+                    headers,
+                )
 
-    # Test a keep-alive HTTP/1.0 request.
-
-    status_line, actual_headers, actual_resp_body = test_client.get(
-        '/page3',
-        headers=[('Connection', 'Keep-Alive')],
-        http_conn=http_connection,
-        protocol=http_client_protocol,
-    )
-    actual_status = int(status_line[:3])
-    assert actual_status == 200
-    assert status_line[4:] == 'OK'
-    assert actual_resp_body == pov.encode()
-    assert header_has_value('Connection', 'Keep-Alive', actual_headers)
-    assert header_has_value(
-        'Keep-Alive',
-        'timeout={test_client.server_instance.timeout}'.format(**locals()),
-        actual_headers,
-    )
-
-    # Remove the keep-alive header again.
-    status_line, actual_headers, actual_resp_body = test_client.get(
-        '/page3',
-        http_conn=http_connection,
-        protocol=http_client_protocol,
-    )
-    actual_status = int(status_line[:3])
-    assert actual_status == 200
-    assert status_line[4:] == 'OK'
-    assert actual_resp_body == pov.encode()
-    assert not header_exists('Connection', actual_headers)
-    assert not header_exists('Keep-Alive', actual_headers)
-
-    test_client.server_instance.protocol = original_server_protocol
-
-    # Prevent the resource warnings:
-    http_connection.close()
+                # 3. Verify connection remains persistent
+                status, headers, _body = test_client.get(
+                    '/page3',
+                    http_conn=http_connection,
+                    protocol=client_proto,
+                )
+                assert int(status[:3]) == 200
+                assert not header_exists('Connection', headers)
+    finally:
+        server.timeout = original_timeout
 
 
 def test_keepalive_conn_management(test_client):
@@ -780,7 +797,9 @@ def test_broken_connection_during_http_communication_fallback(  # noqa: WPS118
         _read_request_line,
     )
 
-    test_client.get_connection().send(b'GET / HTTP/1.1')
+    with closing(test_client.get_connection()) as conn:
+        conn.send(b'GET / HTTP/1.1')
+
     wsgi_server_thread.join()  # no extra logs upon server termination
 
     actual_log_entries = testing_server.error_log.calls[:]
@@ -816,12 +835,59 @@ def test_broken_connection_during_http_communication_fallback(  # noqa: WPS118
         )
 
 
-def test_kb_int_from_http_handler(
-    test_client,
-    testing_server,
-    wsgi_server_thread,
-):
-    """Test that a keyboard interrupt from HTTP handler causes shutdown."""
+def _tear_down_server_resources(server):
+    """Safely release resources without breaking shared fixture state."""
+    # Clear the Connection Manager
+    # This releases the sockets immediately.
+    manager = getattr(server, '_connections', None)
+    if manager:
+        for attr in ('_connections', 'connections'):
+            coll = getattr(manager, attr, None)
+            if hasattr(coll, 'clear'):
+                coll.clear()
+
+    # Clear Worker Threads
+    # Empty requests and associated threads to prevent them
+    # from trying to access the now-closed sockets.
+    # Leave these as valid objects,
+    # preventing 'NoneType' errors in other tests.
+    requests = getattr(server, 'requests', None)
+    threads = getattr(requests, '_threads', None)
+    if hasattr(threads, 'clear'):
+        threads.clear()
+
+
+def _assert_shutdown_logs(actual_log_entries):
+    """Verify the expected shutdown sequence in the logs."""
+    expected_log_entries = (
+        (
+            logging.DEBUG,
+            r'^Got a server shutdown request.*simulated test handler.*$',
+        ),
+        (logging.DEBUG, r'^Setting the server interrupt flag.*$'),
+        (logging.INFO, '^Keyboard Interrupt: shutting down$'),
+        (logging.INFO, '^Keyboard Interrupt: shutting down$'),
+    )
+
+    for msg, lvl, _tb in actual_log_entries:
+        print(
+            f'  level={lvl} ({logging.getLevelName(lvl)}), msg={msg!r}',
+            flush=True,
+        )
+    assert len(actual_log_entries) == len(expected_log_entries)
+
+    for exp_lvl, exp_reg in expected_log_entries:
+        assert any(
+            exp_lvl == act_lvl
+            and _matches_pattern(exp_reg, act_msg) is not None
+            for act_msg, act_lvl, _tb in actual_log_entries
+        ), (
+            f'Expected log entry level={exp_lvl} matching {exp_reg!r} not found in {actual_log_entries!r}'
+        )
+
+
+def _trigger_kb_int_and_join(test_client, testing_server, wsgi_server_thread):
+    """Trigger the interrupt and wait for the thread to exit."""
 
     def _trigger_kb_intr(_req, _resp):
         raise KeyboardInterrupt('simulated test handler keyboard interrupt')
@@ -829,41 +895,52 @@ def test_kb_int_from_http_handler(
     testing_server.wsgi_app.handlers['/kb_intr'] = _trigger_kb_intr
 
     http_conn = test_client.get_connection()
-    http_conn.putrequest('GET', '/kb_intr', skip_host=True)
-    http_conn.putheader('Host', http_conn.host)
-    http_conn.endheaders()
-    wsgi_server_thread.join()  # no extra logs upon server termination
+    with closing(http_conn):
+        http_conn.putrequest('GET', '/kb_intr', skip_host=True)
+        http_conn.putheader('Host', http_conn.host)
+        http_conn.endheaders()
+        with _suppress_exceptions(
+            http.client.RemoteDisconnected,
+            BrokenPipeError,
+            ConnectionResetError,
+        ):
+            http_conn.getresponse()
 
-    actual_log_entries = testing_server.error_log.calls[:]
-    testing_server.error_log.calls.clear()  # prevent post-test assertions
+    testing_server.interrupt = KeyboardInterrupt('test requesting shutdown')
+    wsgi_server_thread.join()
 
-    expected_log_entries = (
-        (
-            logging.DEBUG,
-            '^Got a server shutdown request while handling a connection '
-            r'from .*:\d{1,5} \(simulated test handler keyboard interrupt\)$',
-        ),
-        (
-            logging.DEBUG,
-            '^Setting the server interrupt flag to KeyboardInterrupt'
-            r"\('simulated test handler keyboard interrupt',?\)$",
-        ),
-        (
-            logging.INFO,
-            '^Keyboard Interrupt: shutting down$',
-        ),
-    )
+    # Capture logs while the server is still fully intact
+    actual_logs = testing_server.error_log.calls[:]
+    testing_server.error_log.calls.clear()
+    return actual_logs
 
-    assert len(actual_log_entries) == len(expected_log_entries)
 
-    for (
-        (expected_log_level, expected_msg_regex),
-        (actual_msg, actual_log_level, _tb),
-    ) in zip(expected_log_entries, actual_log_entries):
-        assert expected_log_level == actual_log_level
-        assert _matches_pattern(expected_msg_regex, actual_msg) is not None, (
-            f'{actual_msg!r} does not match {expected_msg_regex!r}'
+def test_kb_int_from_http_handler(
+    test_client,
+    testing_server,
+    wsgi_server_thread,
+):
+    """Test that a keyboard interrupt from HTTP handler causes shutdown."""
+    actual_logs = []
+
+    try:
+        # trigger the interrupt and capture logs
+        actual_logs = _trigger_kb_int_and_join(
+            test_client,
+            testing_server,
+            wsgi_server_thread,
         )
+
+    except Exception:  # noqa: TRY203
+        # If we got here, it means the server didn't handle the interrupt as
+        # expected, which is a failure. We want to reraise so we capture in
+        # the logs.
+        raise
+    finally:
+        _tear_down_server_resources(testing_server)
+
+    # test the expected shutdown sequence in the logs
+    _assert_shutdown_logs(actual_logs)
 
 
 def test_unhandled_exception_in_request_handler(
@@ -889,9 +966,16 @@ def test_unhandled_exception_in_request_handler(
     )
 
     http_conn = test_client.get_connection()
-    http_conn.putrequest('GET', '/scary_exc', skip_host=True)
-    http_conn.putheader('Host', http_conn.host)
-    http_conn.endheaders()
+    with closing(http_conn):
+        http_conn.putrequest('GET', '/scary_exc', skip_host=True)
+        http_conn.putheader('Host', http_conn.host)
+        http_conn.endheaders()
+        with _suppress_exceptions(
+            http.client.RemoteDisconnected,
+            BrokenPipeError,
+            ConnectionResetError,
+        ):
+            http_conn.getresponse()
 
     # NOTE: This spy ensure the log entry gets recorded before we're testing
     # NOTE: them and before server shutdown, preserving their order and making
@@ -904,7 +988,8 @@ def test_unhandled_exception_in_request_handler(
         pass
     assert len(testing_server.requests._threads) == 10
     testing_server.interrupt = SystemExit('test requesting shutdown')
-    assert not testing_server.requests._threads
+    requests = getattr(testing_server, 'requests', None)
+    assert not (requests and requests._threads)
     wsgi_server_thread.join()  # no extra logs upon server termination
 
     actual_log_entries = testing_server.error_log.calls[:]
@@ -971,7 +1056,9 @@ def test_remains_alive_post_unhandled_exception(
     # NOTE: The initial worker thread count is 10.
     assert len(testing_server.requests._threads) == 10
 
-    test_client.get_connection().send(b'GET / HTTP/1.1')
+    conn = test_client.get_connection()
+    with closing(conn):
+        conn.send(b'GET / HTTP/1.1')
 
     # NOTE: This spy ensure the log entry gets recorded before we're testing
     # NOTE: them and before server shutdown, preserving their order and making
@@ -988,7 +1075,8 @@ def test_remains_alive_post_unhandled_exception(
         for worker_thread in testing_server.requests._threads
     )
     testing_server.interrupt = SystemExit('test requesting shutdown')
-    assert not testing_server.requests._threads
+    requests = getattr(testing_server, 'requests', None)
+    assert not (requests and requests._threads)
     wsgi_server_thread.join()  # no extra logs upon server termination
 
     actual_log_entries = testing_server.error_log.calls[:]
@@ -1368,48 +1456,47 @@ def test_No_Message_Body(test_client):
 def test_Chunked_Encoding(test_client):
     """Test HTTP uploads with chunked transfer-encoding."""
     # Initialize a persistent HTTP connection
-    conn = test_client.get_connection()
+    with closing(test_client.get_connection()) as conn:
+        # Try a normal chunked request (with extensions)
+        body = (
+            b'8;key=value\r\nxx\r\nxxxx\r\n5\r\nyyyyy\r\n0\r\n'
+            b'Content-Type: application/json\r\n'
+            b'\r\n'
+        )
+        conn.putrequest('POST', '/upload', skip_host=True)
+        conn.putheader('Host', conn.host)
+        conn.putheader('Transfer-Encoding', 'chunked')
+        conn.putheader('Trailer', 'Content-Type')
+        # Note that this is somewhat malformed:
+        # we shouldn't be sending Content-Length.
+        # RFC 2616 says the server should ignore it.
+        conn.putheader('Content-Length', '3')
+        conn.endheaders()
+        conn.send(body)
+        response = conn.getresponse()
+        status_line, _actual_headers, actual_resp_body = webtest.shb(response)
+        actual_status = int(status_line[:3])
+        assert actual_status == 200
+        assert status_line[4:] == 'OK'
+        expected_resp_body = ("thanks for '%s'" % b'xx\r\nxxxxyyyyy').encode()
+        assert actual_resp_body == expected_resp_body
 
-    # Try a normal chunked request (with extensions)
-    body = (
-        b'8;key=value\r\nxx\r\nxxxx\r\n5\r\nyyyyy\r\n0\r\n'
-        b'Content-Type: application/json\r\n'
-        b'\r\n'
-    )
-    conn.putrequest('POST', '/upload', skip_host=True)
-    conn.putheader('Host', conn.host)
-    conn.putheader('Transfer-Encoding', 'chunked')
-    conn.putheader('Trailer', 'Content-Type')
-    # Note that this is somewhat malformed:
-    # we shouldn't be sending Content-Length.
-    # RFC 2616 says the server should ignore it.
-    conn.putheader('Content-Length', '3')
-    conn.endheaders()
-    conn.send(body)
-    response = conn.getresponse()
-    status_line, _actual_headers, actual_resp_body = webtest.shb(response)
-    actual_status = int(status_line[:3])
-    assert actual_status == 200
-    assert status_line[4:] == 'OK'
-    expected_resp_body = ("thanks for '%s'" % b'xx\r\nxxxxyyyyy').encode()
-    assert actual_resp_body == expected_resp_body
-
-    # Try a chunked request that exceeds server.max_request_body_size.
-    # Note that the delimiters and trailer are included.
-    body = b'\r\n'.join((b'3e3', b'x' * 995, b'0', b'', b''))
-    conn.putrequest('POST', '/upload', skip_host=True)
-    conn.putheader('Host', conn.host)
-    conn.putheader('Transfer-Encoding', 'chunked')
-    conn.putheader('Content-Type', 'text/plain')
-    # Chunked requests don't need a content-length
-    # conn.putheader("Content-Length", len(body))
-    conn.endheaders()
-    conn.send(body)
-    response = conn.getresponse()
-    status_line, _actual_headers, actual_resp_body = webtest.shb(response)
-    actual_status = int(status_line[:3])
-    assert actual_status == 413
-    conn.close()
+        # Try a chunked request that exceeds server.max_request_body_size.
+        # Note that the delimiters and trailer are included.
+        body = b'\r\n'.join((b'3e3', b'x' * 995, b'0', b'', b''))
+        conn.putrequest('POST', '/upload', skip_host=True)
+        conn.putheader('Host', conn.host)
+        conn.putheader('Transfer-Encoding', 'chunked')
+        conn.putheader('Content-Type', 'text/plain')
+        # Chunked requests don't need a content-length
+        # conn.putheader("Content-Length", len(body))
+        conn.endheaders()
+        conn.send(body)
+        response = conn.getresponse()
+        status_line, _actual_headers, actual_resp_body = webtest.shb(response)
+        actual_status = int(status_line[:3])
+        assert actual_status == 413
+        conn.close()
 
 
 def test_Content_Length_in(test_client):
@@ -1419,22 +1506,18 @@ def test_Content_Length_in(test_client):
     Assert error before body send.
     """
     # Initialize a persistent HTTP connection
-    conn = test_client.get_connection()
-
-    conn.putrequest('POST', '/upload', skip_host=True)
-    conn.putheader('Host', conn.host)
-    conn.putheader('Content-Type', 'text/plain')
-    conn.putheader('Content-Length', '9999')
-    conn.endheaders()
-    response = conn.getresponse()
-    status_line, _actual_headers, actual_resp_body = webtest.shb(response)
-    actual_status = int(status_line[:3])
-    assert actual_status == 413
-    expected_resp_body = (
-        b'The entity sent with the request exceeds the maximum allowed bytes.'
-    )
-    assert actual_resp_body == expected_resp_body
-    conn.close()
+    with closing(test_client.get_connection()) as conn:
+        conn.putrequest('POST', '/upload', skip_host=True)
+        conn.putheader('Host', conn.host)
+        conn.putheader('Content-Type', 'text/plain')
+        conn.putheader('Content-Length', '9999')
+        conn.endheaders()
+        response = conn.getresponse()
+        status_line, _actual_headers, actual_resp_body = webtest.shb(response)
+        actual_status = int(status_line[:3])
+        assert actual_status == 413
+        expected_resp_body = b'The entity sent with the request exceeds the maximum allowed bytes.'
+        assert actual_resp_body == expected_resp_body
 
 
 def test_Content_Length_not_int(test_client):

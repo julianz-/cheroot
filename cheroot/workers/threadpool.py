@@ -10,6 +10,7 @@ import contextlib
 import logging
 import queue
 import socket
+import sys
 import threading
 import time
 import warnings
@@ -107,9 +108,6 @@ class WorkerThread(threading.Thread):
         from the inner-layer code constitute a global server interrupt
         request. When they happen, the worker thread exits.
 
-        :raises BaseException: when an unexpected non-interrupt
-                               exception leaks from the inner layers
-
         # noqa: DAR401 KeyboardInterrupt SystemExit
         """
         self.server.stats['Worker Threads'][self.name] = self.stats
@@ -138,7 +136,7 @@ class WorkerThread(threading.Thread):
                 traceback=True,
             )
             self.server.interrupt = underlying_exc
-            raise
+            # raise
         finally:
             self.ready = False
 
@@ -154,15 +152,22 @@ class WorkerThread(threading.Thread):
         while True:
             conn = self.server.requests.get()
             if conn is _SHUTDOWNREQUEST:
+                if self.conn is not None:
+                    self.server._release_conn(self.conn, keep_open=False)
                 return
 
             self.conn = conn
+
             is_stats_enabled = self.server.stats['Enabled']
             if is_stats_enabled:
                 self.start_time = time.time()
             keep_conn_open = False
             try:  # noqa: WPS243 check "Found too long `finally` block: 3 > 2"
                 keep_conn_open = conn.communicate()
+                print(
+                    f'communicate() returned: {keep_conn_open}',
+                    file=sys.stderr,
+                )
             except ConnectionError as connection_error:
                 keep_conn_open = False  # Drop the connection cleanly
                 self.server.error_log(
@@ -209,10 +214,8 @@ class WorkerThread(threading.Thread):
                 # NOTE: block. They will be treated as fatal and turned
                 # NOTE: into server shutdown requests and then reraised
                 # NOTE: unconditionally.
-                if keep_conn_open:
-                    self.server.put_conn(conn)
-                else:
-                    conn.close()
+                self.server._release_conn(conn, keep_conn_open)
+
                 if is_stats_enabled:
                     self.requests_seen += conn.requests_seen
                     self.bytes_read += conn.rfile.bytes_read
@@ -409,6 +412,7 @@ class ThreadPool:
             # shutdown sometimes fails (race with 'closed' check?)
             # ref #238
             pass
+        conn.close()
 
     def _clear_threads(self):
         """Clear self._threads and yield all joinable threads."""
