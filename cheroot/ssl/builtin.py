@@ -45,10 +45,14 @@ def _assert_ssl_exc_contains(exc, *msgs):
 
 def _loopback_for_cert_thread(context, server, handshake_done):
     """Thread target for loopback connection to parse a cert."""
+    # As we only care about parsing the certificate, the failure of
+    # which will cause an exception in ``_loopback_for_cert``,
+    # we can safely ignore connection and ssl related exceptions. Ref:
+    # https://github.com/cherrypy/cheroot/issues/302#issuecomment-662592030
     ssl_sock = None
     handshake_timeout = 5.0  # Prevent CI from hanging on handshake
     try:
-        try:
+        with suppress(Exception):
             ssl_sock = context.wrap_socket(
                 server,
                 do_handshake_on_connect=True,
@@ -56,18 +60,20 @@ def _loopback_for_cert_thread(context, server, handshake_done):
             )
             if ssl_sock:
                 with suppress(OSError):
+                    # TLS 1.3 sends session tickets as a post-handshake message
+                    # at an unspecified time. On Windows, closing before the
+                    # client receives them is treated as an incomplete
+                    # handshake, raising ConnectionAbortedError. We send a
+                    # small amount of data to give the server a chance to send
+                    # the tickets and close cleanly. This is a race condition
+                    # so the error may still occasionally occur
                     ssl_sock.send(b'0000')
-        except Exception as exc:
-            print(
-                f'Loopback thread handshake failed: {exc!r}',
-                file=sys.stderr,
-            )
     finally:
         if ssl_sock:
             with suppress(OSError):
                 ssl_sock.close()
 
-        # 4. CRITICAL: Wait for main thread to finish its wrap attempt
+        # Wait for main thread to finish its wrap attempt
         # before we kill the raw server socket.
         handshake_done.wait(timeout=handshake_timeout)
         server.close()
@@ -86,10 +92,17 @@ def _loopback_for_cert(
     *,
     private_key_password=None,
 ):
-    """Create a loopback connection to parse a cert with a private key."""
+    """Create a loopback connection to parse a cert.
+
+    Used by the builtin adapter to retrieve information about the
+    server's SSL certificate that will be available in the
+    WSGI environment variables. Since Python's ssl module has no
+    public API to parse a cert directly, this function performs a
+    minimal SSL handshake with itself to extract the cert details.
+    """
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
-    # 2. Add the CA file if provided
+    # add the CA file if it's provided
     if certificate_chain:
         context.load_verify_locations(cafile=certificate_chain)
 
@@ -101,8 +114,7 @@ def _loopback_for_cert(
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
 
-    # Python 3+ Unix, Python 3.5+ Windows
-    socket_timeout = 2.0  # Prevent CI from hanging on handshake
+    socket_timeout = 2.0
     # Ensure thread has time to finish after handshake timeout
     thread_timeout = socket_timeout + 1.0
     client, server = socket.socketpair()
@@ -110,6 +122,13 @@ def _loopback_for_cert(
     server.settimeout(socket_timeout)
 
     handshake_done = threading.Event()
+
+    # `wrap_socket` will block until the ssl handshake is complete.
+    # Both ends must call wrap_socket concurrently —
+    # hence we create a thread to call on the server side.
+    # handshake_done signals to the server thread that the main thread
+    # has finished, so the thread can exit cleanly regardless of
+    # success or failure.
     thread = threading.Thread(
         target=_loopback_for_cert_thread,
         args=(context, server, handshake_done),
@@ -132,13 +151,14 @@ def _loopback_for_cert(
                 with suppress(OSError):
                     ssl_sock.close()
     finally:
-        # 1. Signal the thread that the main thread is exiting its wrap attempt
+        # Signal the thread that the main thread is exiting its wrap attempt
         handshake_done.set()
 
-        # 2. Wait for thread to finish BEFORE closing ANY raw sockets
+        # Wait for thread to finish BEFORE closing ANY raw sockets
         thread.join(timeout=thread_timeout)
 
-        # 3. Final cleanup of transport layer
+        # Final cleanup of transport layer
+        # Doesn't matter if the sockets have already been closed
         client.close()
         server.close()
 
@@ -343,19 +363,11 @@ class BuiltinSSLAdapter(Adapter):
             ssl.SSLEOFError,
             ssl.SSLZeroReturnError,
         ) as tls_connection_drop_error:
-            print(
-                f'builtin wrap raising FatalSSLAlert: {tls_connection_drop_error}',
-                file=sys.stderr,
-            )
             sock.close()
             raise errors.FatalSSLAlert(
                 *tls_connection_drop_error.args,
             ) from tls_connection_drop_error
         except ssl.SSLError as generic_tls_error:
-            print(
-                f'builtin wrap SSLError: {generic_tls_error}',
-                file=sys.stderr,
-            )
             peer_speaks_plain_http_over_https = (
                 generic_tls_error.errno == ssl.SSL_ERROR_SSL
                 and _assert_ssl_exc_contains(generic_tls_error, 'http request')
@@ -370,10 +382,6 @@ class BuiltinSSLAdapter(Adapter):
                 *generic_tls_error.args,
             ) from generic_tls_error
         except OSError as tcp_connection_drop_error:
-            print(
-                f'builtin wrap OSError: {tcp_connection_drop_error}',
-                file=sys.stderr,
-            )
             sock.close()
             raise errors.FatalSSLAlert(
                 *tcp_connection_drop_error.args,

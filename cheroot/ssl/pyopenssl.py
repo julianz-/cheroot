@@ -124,10 +124,6 @@ class SSLFileobjectMixin:
                     # The client is talking HTTP to an HTTPS server.
                     raise errors.NoSSLError
 
-                print(
-                    f'_safe_call raising FatalSSLAlert: {e}',
-                    file=sys.stderr,
-                )
                 raise errors.FatalSSLAlert(*e.args)
 
             if time.time() - start > self.ssl_timeout:

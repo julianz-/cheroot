@@ -193,9 +193,6 @@ comma_separated_headers = [
     b'WWW-Authenticate',
 ]
 
-
-logger = logging.getLogger(__name__)
-
 if not hasattr(logging, 'statistics'):
     logging.statistics = {}
 
@@ -1348,10 +1345,6 @@ class HTTPConnection:
             # if the hadnshake fails in wrap(). pyopenssl
             # defers the handshake until the first read/write,
             # so we have to do it here.
-            print(
-                f'FatalSSLAlert: socket type={type(self.socket)}, has _socket={hasattr(self.socket, "_socket")}',
-                file=sys.stderr,
-            )
             if hasattr(self.socket, '_socket'):
                 with contextlib.suppress(OSError):
                     self.socket.close()  # close SSLConnection first
@@ -1421,10 +1414,8 @@ class HTTPConnection:
         finally:
             self.socket.close()
             if hasattr(self.socket, '_socket'):
-                try:
+                with contextlib.suppress(OSError):
                     self.socket._socket.close()
-                except OSError as e:
-                    print(f'OSError closing _socket: {e}', file=sys.stderr)
 
     def close(self):
         """Close the socket underlying this connection."""
@@ -1543,20 +1534,11 @@ class HTTPConnection:
             self.socket.shutdown,
         )
 
-        print(
-            f'_close_kernel_socket: calling shutdown on {self.socket}',
-            file=sys.stderr,
-        )
         try:
             shutdown(socket.SHUT_RDWR)
-            print('_close_kernel_socket: shutdown complete', file=sys.stderr)
         except errors.acceptable_sock_shutdown_exceptions:
-            print(
-                '_close_kernel_socket: acceptable exception',
-                file=sys.stderr,
-            )
+            pass
         except socket.error as e:
-            print(f'_close_kernel_socket: socket.error {e}', file=sys.stderr)
             if e.errno not in errors.acceptable_sock_shutdown_error_codes:
                 raise
 
@@ -2322,8 +2304,6 @@ class HTTPServer:
 
     def stop(self):  # noqa: C901  # FIXME
         """Gracefully shutdown a server that is serving forever."""
-        logger.warning('STOP CALLED: ready=%s', self.ready)
-
         if not self.ready:
             return  # already stopped
 
@@ -2339,7 +2319,6 @@ class HTTPServer:
 
         if self._connections is not None:
             self._connections.stop()
-            print('stop(): connections.stop() complete', file=sys.stderr)
 
         sock = getattr(self, 'socket', None)
         if sock:
@@ -2361,99 +2340,40 @@ class HTTPServer:
 
                         try:
                             s = socket.socket(af, socktype, proto)
-                            fd = s.fileno()
-                            print(
-                                f'touch socket created: fd={fd}, af={af}',
-                                file=sys.stderr,
-                            )
                             with s:
                                 s.settimeout(1.0)
                                 s.connect((host, port))
 
-                            print(
-                                f'touch socket closed: fd={fd}, af={af}',
-                                file=sys.stderr,
-                            )
                             break  # one successful touch is enough
-                        except socket.error as err:
-                            print(
-                                f'touch socket error: {err!r}, af={af}',
-                                file=sys.stderr,
-                            )
+                        except socket.error:
+                            pass
+
             if hasattr(sock, 'close'):
                 sock.close()
-                print('stop(): server socket closed', file=sys.stderr)
             self.socket = None
 
         if self._connections is not None:
             self._connections.close()  # close idle connections
-            print('stop(): connections.close() complete', file=sys.stderr)
 
         if hasattr(self, 'requests') and self.requests:
-            print(
-                f'stop(): stopping requests with timeout={self.shutdown_timeout}',
-                file=sys.stderr,
-            )
             self.requests.stop(self.shutdown_timeout)
-            print('stop(): requests stopped', file=sys.stderr)
 
         if self._active_conn_count > 0:
-            print(
-                f'[server {id(self)}] waiting for workers to finish processing '
-                f'active_conn_count is {self._active_conn_count}',
-                file=sys.stderr,
-            )
             self._no_active_connections.wait(timeout=1.0)
-            print(
-                'active connections is now: '
-                f'{self._active_conn_count} remaining.',
-            )
 
-        connection_manager = self._connections
-        if connection_manager is not None:
-            for attr_name in ('_connections', 'connections'):
-                coll = getattr(connection_manager, attr_name, None)
-                if hasattr(coll, 'clear'):
-                    print(
-                        f'Clearing collection {attr_name} in connection manager',
-                    )
-                    coll.clear()
-
-        print('stop(): complete', file=sys.stderr)
         self._connections = None
         self.requests = None
         self.socket = None
 
     def _release_conn(self, conn, keep_open):
         """Release a connection back to the pool or close it."""
-        print(
-            f'[server {id(self)}]'
-            f'_release_conn: keep_open={keep_open}, ready={self.ready}, count={self._active_conn_count}',
-            file=sys.stderr,
-        )
         if keep_open and self.ready:
             try:
                 self._connections.put(conn)
-                print(
-                    f'_release_conn: put back in selector, count stays at {self._active_conn_count}',
-                    file=sys.stderr,
-                )
                 return
             except ValueError:
                 pass
-        print(
-            f'_release_conn: closed, count={self._active_conn_count}',
-            file=sys.stderr,
-        )
-        try:
-            conn.close()
-            print('_release_conn: conn.close() complete', file=sys.stderr)
-        except Exception as e:
-            print(
-                f'Error while closing connection: {e}',
-                file=sys.stderr,
-            )
-            raise
+        conn.close()
 
 
 class Gateway:

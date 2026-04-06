@@ -343,14 +343,6 @@ def test_ssl_adapters(  # pylint: disable=too-many-positional-arguments
     assert resp.text == 'Hello world!'
 
 
-def test_socket_type():
-    """Ensure that socket.socket is properly patched to TraceableSocket."""
-    s = socket.socket()
-    print(f'Current socket type: {type(s)}')
-    assert 'TraceableSocket' in str(type(s))
-    s.close()
-
-
 @pytest.mark.parametrize(  # noqa: C901  # FIXME
     'adapter_type',
     (
@@ -399,10 +391,6 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
     requests_session,
 ):
     """Verify that client TLS certificate auth works correctly."""
-    test_socket_type()
-    # import tracemalloc
-    # tracemalloc.start()
-    # snapshot1 = tracemalloc.take_snapshot()
     test_cert_rejection = (
         tls_verify_mode != ssl.CERT_NONE and not is_trusted_cert
     )
@@ -468,12 +456,6 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
             assert is_req_successful
             assert resp.text == 'Hello world!'
             resp.close()
-            # snapshot2 = tracemalloc.take_snapshot()
-            # top_stats = snapshot2.compare_to(snapshot1, 'lineno')
-
-            # print("[ Top 5 Memory Increases ]")
-            # for stat in top_stats[:5]:
-            #     print(stat)
             return
 
         # xfail some flaky tests

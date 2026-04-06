@@ -10,7 +10,6 @@ import contextlib
 import logging
 import queue
 import socket
-import sys
 import threading
 import time
 import warnings
@@ -125,6 +124,10 @@ class WorkerThread(threading.Thread):
             # NOTE: This is the last resort logging with the last dying breath
             # NOTE: of the worker. It is only reachable when exceptions happen
             # NOTE: in the `finally` branch of the internal try/except block.
+            # NOTE: We do NOT re-raise here because a raw exception in a worker
+            # NOTE: thread can cause a silent thread leak.
+            # NOTE: Instead, we set the 'interrupt' flag to signal the
+            # NOTE: master thread that a catastrophic failure occurred.
             self.server.error_log(
                 'A fatal exception happened. Setting the server interrupt flag'
                 f' to {underlying_exc!r} and giving up.'
@@ -136,7 +139,7 @@ class WorkerThread(threading.Thread):
                 traceback=True,
             )
             self.server.interrupt = underlying_exc
-            # raise
+
         finally:
             self.ready = False
 
@@ -164,10 +167,6 @@ class WorkerThread(threading.Thread):
             keep_conn_open = False
             try:  # noqa: WPS243 check "Found too long `finally` block: 3 > 2"
                 keep_conn_open = conn.communicate()
-                print(
-                    f'communicate() returned: {keep_conn_open}',
-                    file=sys.stderr,
-                )
             except ConnectionError as connection_error:
                 keep_conn_open = False  # Drop the connection cleanly
                 self.server.error_log(

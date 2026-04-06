@@ -3,7 +3,6 @@
 import errno
 import gc
 import http.client
-import logging
 import socket
 import threading
 import time
@@ -24,8 +23,6 @@ ANY_INTERFACE_IPV6 = '::'
 # We use special exit code to indicate success, rather than normal zero, so
 # the test doesn't acidentally pass:
 SUCCESSFUL_SUBPROCESS_EXIT = 23
-
-logger = logging.getLogger(__name__)
 
 config = {
     cheroot.wsgi.Server: {
@@ -79,7 +76,6 @@ def cheroot_server(server_factory):  # noqa: WPS210, WPS231
     # FIXME: Expose this thread through a fixture so that it
     # FIXME: could be awaited in tests.
     server_thread = threading.Thread(target=httpserver.safe_start)
-    # server_thread.daemon = True
     server_thread.start()  # spawn it
     while not httpserver.ready:  # wait until fully initialized and bound
         time.sleep(0.1)
