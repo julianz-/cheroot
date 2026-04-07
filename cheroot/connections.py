@@ -295,6 +295,27 @@ class ConnectionManager:
             with _cm.suppress(OSError):
                 conn.close()
 
+    def _setup_conn_addr(self, conn, s, addr):
+        """Configure remote address and port for the connection.
+
+        Populates the connection object with remote address metadata.
+        If the address is unavailable following the handshake, this
+        method detects the socket's address family (IPv4/IPv6)
+        and provides an appropriate 'any' address placeholder.
+        """
+        # optional values
+        # Until we do DNS lookups, omit REMOTE_HOST
+        if addr is None:  # sometimes this can happen
+            # figure out if AF_INET or AF_INET6.
+            if len(s.getsockname()) == 2:
+                # AF_INET
+                addr = ('0.0.0.0', 0)
+            else:
+                # AF_INET6
+                addr = ('::', 0)
+        conn.remote_addr = addr[0]
+        conn.remote_port = addr[1]
+
     def _from_server_socket(self, server_socket):  # noqa: C901  # FIXME
         try:
             s, addr = server_socket.accept()
@@ -335,18 +356,7 @@ class ConnectionManager:
             conn = self.server.ConnectionClass(self.server, s, mf)
 
             if not isinstance(self.server.bind_addr, (str, bytes)):
-                # optional values
-                # Until we do DNS lookups, omit REMOTE_HOST
-                if addr is None:  # sometimes this can happen
-                    # figure out if AF_INET or AF_INET6.
-                    if len(s.getsockname()) == 2:
-                        # AF_INET
-                        addr = ('0.0.0.0', 0)
-                    else:
-                        # AF_INET6
-                        addr = ('::', 0)
-                conn.remote_addr = addr[0]
-                conn.remote_port = addr[1]
+                self._setup_conn_addr(conn, s, addr)
 
             conn.ssl_env = ssl_env
             return conn
