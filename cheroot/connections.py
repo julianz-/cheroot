@@ -385,27 +385,36 @@ class ConnectionManager:
         if hasattr(s, 'settimeout'):
             s.settimeout(self.server.timeout)
 
-    def _from_server_socket(self, server_socket):
-        # Accept the raw connection
+    def _prepare_socket(self, server_socket):
+        """Handle physical accept and TLS negotiation."""
         result = self._accept_conn(server_socket)
         if result is None:
-            return None
+            return None, None, None, None
         s, addr = result
 
         self._configure_socket(s)
 
-        # Handle TLS wrap if applicable
         mf = MakeFile
         ssl_env = {}
+
         if self.server.ssl_adapter is not None:
             s, ssl_env = self._wrap_socket_for_tls(s, addr)
             if not s:
-                return None
+                return None, None, None, None
 
             mf = self.server.ssl_adapter.makefile
             # Re-apply our timeout since we may have a new socket object
             if hasattr(s, 'settimeout'):
                 s.settimeout(self.server.timeout)
+
+        return s, addr, mf, ssl_env
+
+    def _from_server_socket(self, server_socket):
+        """Orchestrate the creation of a connection from a server socket."""
+        # Handle the connection acceptance and the TLS wrapping if applicable
+        s, addr, mf, ssl_env = self._prepare_socket(server_socket)
+        if s is None:
+            return None
 
         # Initialize the Connection object
         conn = self.server.ConnectionClass(self.server, s, mf)
