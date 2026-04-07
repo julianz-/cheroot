@@ -317,6 +317,7 @@ class ConnectionManager:
         conn.remote_port = addr[1]
 
     def _ignore_socket_oserror(self, exc):
+        """Determine if an OSError during socket operations should be ignored."""
         if self.server.stats['Enabled']:
             self.server.stats['Socket Errors'] += 1
         err_code = exc.args[0]
@@ -333,6 +334,35 @@ class ConnectionManager:
 
         return is_eintr or is_nonblocking or is_ignored
 
+    def _wrap_socket_for_tls(self, raw_socket, addr):
+        """Handle the TLS wrap and log specific error responses.
+
+        on success returns e.g. (SSLSocket, {'SSL_PROTOCOL': 'TLSv1.3', ...}).
+        on failure returns None, {}
+        """
+        try:
+            return self.server.ssl_adapter.wrap(raw_socket)
+        except errors.FatalSSLAlert as tls_connection_drop_error:
+            self.server.error_log(
+                f'Client {addr!s} lost — peer dropped the TLS '
+                'connection suddenly, during handshake: '
+                f'{tls_connection_drop_error!s}',
+            )
+            return None, {}
+        except errors.NoSSLError as http_over_https_err:
+            self.server.error_log(
+                f'Client {addr!s} attempted to speak plain HTTP into '
+                'a TCP connection configured for TLS-only traffic — '
+                'trying to send back a plain HTTP error response: '
+                f'{http_over_https_err!s}',
+            )
+            self._send_bad_request_plain_http_error(raw_socket)
+
+        # If we hit either exception, close the socket and signal failure
+        with _cm.suppress(OSError):
+            raw_socket.close()
+        return None, {}
+
     def _from_server_socket(self, server_socket):  # noqa: C901  # FIXME
         try:
             s, addr = server_socket.accept()
@@ -346,25 +376,10 @@ class ConnectionManager:
             ssl_env = {}
             # if ssl cert and key are set, we try to be a secure HTTP server
             if self.server.ssl_adapter is not None:
-                # FIXME: WPS505 -- too many nested blocks
-                try:  # noqa: WPS505
-                    s, ssl_env = self.server.ssl_adapter.wrap(s)
-                except errors.FatalSSLAlert as tls_connection_drop_error:
-                    self.server.error_log(
-                        f'Client {addr!s} lost — peer dropped the TLS '
-                        'connection suddenly, during handshake: '
-                        f'{tls_connection_drop_error!s}',
-                    )
+                s, ssl_env = self._wrap_socket_for_tls(s, addr)
+                if not s:
                     return None
-                except errors.NoSSLError as http_over_https_err:
-                    self.server.error_log(
-                        f'Client {addr!s} attempted to speak plain HTTP into '
-                        'a TCP connection configured for TLS-only traffic — '
-                        'trying to send back a plain HTTP error response: '
-                        f'{http_over_https_err!s}',
-                    )
-                    self._send_bad_request_plain_http_error(s)
-                    return None
+
                 mf = self.server.ssl_adapter.makefile
                 # Re-apply our timeout since we may have a new socket object
                 if hasattr(s, 'settimeout'):
