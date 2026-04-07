@@ -363,8 +363,8 @@ class ConnectionManager:
             raw_socket.close()
         return None, {}
 
-    def _from_server_socket(self, server_socket):  # noqa: C901  # FIXME
-        # Accept the raw connection
+    def _accept_conn(self, server_socket):
+        """Accept the connection."""
         try:
             s, addr = server_socket.accept()
         except socket.timeout:
@@ -374,9 +374,17 @@ class ConnectionManager:
                 return None
             raise
 
-        # Update stats and basic socket config
         if self.server.stats['Enabled']:
             self.server.stats['Accepts'] += 1
+
+        return s, addr
+
+    def _from_server_socket(self, server_socket):
+        # Accept the raw connection
+        result = self._accept_conn(server_socket)
+        if result is None:
+            return None
+        s, addr = result
 
         prevent_socket_inheritance(s)
         if hasattr(s, 'settimeout'):
