@@ -316,6 +316,23 @@ class ConnectionManager:
         conn.remote_addr = addr[0]
         conn.remote_port = addr[1]
 
+    def _ignore_socket_oserror(self, exc):
+        if self.server.stats['Enabled']:
+            self.server.stats['Socket Errors'] += 1
+        err_code = exc.args[0]
+
+        # EINTR should occur when a signal is received during accept();
+        # retry the call. See https://github.com/cherrypy/cherrypy/issues/707.
+        is_eintr = err_code in errors.socket_error_eintr
+
+        # Just try again. See https://github.com/cherrypy/cherrypy/issues/479.
+        is_nonblocking = err_code in errors.socket_errors_nonblocking
+
+        # Our socket was closed. See https://github.com/cherrypy/cherrypy/issues/686.
+        is_ignored = err_code in errors.socket_errors_to_ignore
+
+        return is_eintr or is_nonblocking or is_ignored
+
     def _from_server_socket(self, server_socket):  # noqa: C901  # FIXME
         try:
             s, addr = server_socket.accept()
@@ -366,24 +383,8 @@ class ConnectionManager:
             # notice keyboard interrupts on Win32, which don't interrupt
             # accept() by default
             return None
-        except OSError as ex:
-            if self.server.stats['Enabled']:
-                self.server.stats['Socket Errors'] += 1
-            if ex.args[0] in errors.socket_error_eintr:
-                # I *think* this is right. EINTR should occur when a signal
-                # is received during the accept() call; all docs say retry
-                # the call, and I *think* I'm reading it right that Python
-                # will then go ahead and poll for and handle the signal
-                # elsewhere. See
-                # https://github.com/cherrypy/cherrypy/issues/707.
-                return None
-            if ex.args[0] in errors.socket_errors_nonblocking:
-                # Just try again. See
-                # https://github.com/cherrypy/cherrypy/issues/479.
-                return None
-            if ex.args[0] in errors.socket_errors_to_ignore:
-                # Our socket was closed.
-                # See https://github.com/cherrypy/cherrypy/issues/686.
+        except OSError as exc:
+            if self._ignore_socket_oserror(exc):
                 return None
             raise
 
