@@ -364,44 +364,45 @@ class ConnectionManager:
         return None, {}
 
     def _from_server_socket(self, server_socket):  # noqa: C901  # FIXME
+        # Accept the raw connection
         try:
             s, addr = server_socket.accept()
-            if self.server.stats['Enabled']:
-                self.server.stats['Accepts'] += 1
-            prevent_socket_inheritance(s)
-            if hasattr(s, 'settimeout'):
-                s.settimeout(self.server.timeout)
-
-            mf = MakeFile
-            ssl_env = {}
-            # if ssl cert and key are set, we try to be a secure HTTP server
-            if self.server.ssl_adapter is not None:
-                s, ssl_env = self._wrap_socket_for_tls(s, addr)
-                if not s:
-                    return None
-
-                mf = self.server.ssl_adapter.makefile
-                # Re-apply our timeout since we may have a new socket object
-                if hasattr(s, 'settimeout'):
-                    s.settimeout(self.server.timeout)
-
-            conn = self.server.ConnectionClass(self.server, s, mf)
-
-            if not isinstance(self.server.bind_addr, (str, bytes)):
-                self._setup_conn_addr(conn, s, addr)
-
-            conn.ssl_env = ssl_env
-            return conn
-
         except socket.timeout:
-            # The only reason for the timeout in start() is so we can
-            # notice keyboard interrupts on Win32, which don't interrupt
-            # accept() by default
             return None
         except OSError as exc:
             if self._ignore_socket_oserror(exc):
                 return None
             raise
+
+        # Update stats and basic socket config
+        if self.server.stats['Enabled']:
+            self.server.stats['Accepts'] += 1
+
+        prevent_socket_inheritance(s)
+        if hasattr(s, 'settimeout'):
+            s.settimeout(self.server.timeout)
+
+        # Handle TLS wrap if applicable
+        mf = MakeFile
+        ssl_env = {}
+        if self.server.ssl_adapter is not None:
+            s, ssl_env = self._wrap_socket_for_tls(s, addr)
+            if not s:
+                return None
+
+            mf = self.server.ssl_adapter.makefile
+            # Re-apply our timeout since we may have a new socket object
+            if hasattr(s, 'settimeout'):
+                s.settimeout(self.server.timeout)
+
+        # Initialize the Connection object
+        conn = self.server.ConnectionClass(self.server, s, mf)
+        conn.ssl_env = ssl_env
+
+        if not isinstance(self.server.bind_addr, (str, bytes)):
+            self._setup_conn_addr(conn, s, addr)
+
+        return conn
 
     def close(self):
         """Close all monitored connections."""
