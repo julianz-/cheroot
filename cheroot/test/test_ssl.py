@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 import traceback
+from collections import namedtuple
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +29,10 @@ from cryptography.hazmat.primitives.serialization import (
     load_pem_private_key,
 )
 
+from cheroot import (
+    connections as _connections,
+    errors,
+)
 from cheroot.connections import ConnectionManager
 from cheroot.ssl import Adapter, _ensure_peer_speaks_https
 
@@ -1154,3 +1160,189 @@ def test_prepare_socket_emits_deprecation_warning(
     assert sock.fileno() > 0
 
     sock.close()
+
+
+@pytest.fixture
+def conn_manager():
+    """Create a ConnectionManager with a minimal stub server."""
+    # Create the object without running the heavy __init__
+    mgr = ConnectionManager.__new__(ConnectionManager)
+
+    # Use SimpleNamespace to fake the server and its stats
+    mgr.server = SimpleNamespace(
+        stats={'Enabled': True, 'Socket Errors': 0},
+    )
+    return mgr
+
+
+def test_ignore_socket_oserror_increments_stats(conn_manager):
+    """Test the socket OSError handler for interrupt errors."""
+    # Simulate an interrupt error
+    exc = OSError(errors.socket_error_eintr[0])
+
+    result = conn_manager._ignore_socket_oserror(exc)
+
+    assert result is True
+    assert conn_manager.server.stats['Socket Errors'] == 1
+
+
+def test_ignore_socket_oserror_disabled_stats(conn_manager):
+    """Test the socket OSError handler for disabled_stats."""
+    conn_manager.server.stats['Enabled'] = False
+    exc = OSError(errors.socket_error_eintr[0])
+
+    conn_manager._ignore_socket_oserror(exc)
+
+    # Should NOT increment since 'Enabled' is False
+    assert conn_manager.server.stats['Socket Errors'] == 0
+
+
+@pytest.mark.parametrize(
+    ('err_code', 'expected'),
+    (
+        (errors.socket_error_eintr[0], True),
+        (errors.socket_errors_nonblocking[0], True),
+        (errors.socket_errors_to_ignore[0], True),
+        (999, False),
+    ),
+)
+def test_ignore_socket_oserror_logic_branches(
+    conn_manager,
+    err_code,
+    expected,
+):
+    """Test the socket OSError handler for ignorable errors."""
+    exc = OSError(err_code)
+    assert conn_manager._ignore_socket_oserror(exc) is expected
+
+
+def _raise_eintr(*args, **kwargs):
+    """Raise an interrupt error."""
+    raise OSError(errno.EINTR, 'Interrupted system call')
+
+
+def test_from_server_socket_interrupt_error(conn_manager_with_server):
+    """Verify that _from_server_socket returns None on ignorable OS errors."""
+    # Assign that function to 'accept'
+    fake_server_socket = SimpleNamespace(
+        accept=_raise_eintr,
+    )
+
+    # Execute
+    conn = conn_manager_with_server._from_server_socket(fake_server_socket)
+    assert conn is None
+
+
+@pytest.fixture
+def conn_manager_with_server():
+    """Create a ConnectionManager with a stub server."""
+    mgr = ConnectionManager.__new__(ConnectionManager)
+    mgr.server = SimpleNamespace(
+        stats={'Enabled': True, 'Accepts': 0, 'Socket Errors': 0},
+        ssl_adapter=None,
+        timeout=10,
+        # Explicitly 3 args to match the modern pipeline
+        ConnectionClass=lambda server, s, mf: SimpleNamespace(
+            server=server,
+            sock=s,
+            makefile=mf,
+            remote_addr=None,
+            remote_port=None,
+        ),
+        bind_addr=('127.0.0.1', 8080),
+    )
+    return mgr
+
+
+@pytest.fixture
+def fake_socket():
+    """Provide a basic mock socket."""
+    return SimpleNamespace(
+        settimeout=lambda t: None,
+        fileno=lambda: 10,
+        close=lambda: None,
+        getsockname=lambda: ('127.0.0.1', 8080),
+    )
+
+
+def _dummy_fcntl(fd, op, arg=0):
+    """Return nothing instead of a real file control."""
+    return 0
+
+
+def raise_os_error(*args, **kwargs):
+    """Raise OSError in a mock."""
+    raise OSError('Broken')
+
+
+Scenario = namedtuple(
+    'Scenario',
+    ['client_s', 'provided_addr', 'expected_addr', 'expect_error'],
+)
+
+
+@pytest.mark.parametrize(
+    'scenario',
+    (
+        Scenario(None, ('127.0.0.1', 123), ('127.0.0.1', 123), False),
+        Scenario(None, None, ('0.0.0.0', 0), False),
+        Scenario(
+            SimpleNamespace(
+                settimeout=raise_os_error,
+                fileno=lambda: 11,
+                close=lambda: None,
+            ),
+            ('10.0.0.1', 456),
+            ('10.0.0.1', 456),
+            True,
+        ),
+    ),
+    ids=(
+        'standard-success',
+        'missing-addr-fallback',
+        'broken-socket-oserror',
+    ),
+)
+def test_from_server_socket_scenarios(
+    conn_manager_with_server,
+    fake_socket,
+    monkeypatch,
+    scenario,
+):
+    """
+    Verify high-level connection orchestration from sockets.
+
+    This test ensures that the ``_from_server_socket()``
+    pipeline correctly:
+    1. Accepts a connection from the server socket.
+    2. Configures the resulting client socket.
+    3. Successfully increments 'Accepts' stats on successful configuration.
+    4. Wraps the socket into a Connection object.
+    """
+    # 1. Neuter fcntl right here inside the function
+    if hasattr(_connections, 'fcntl'):
+        # Patch the function
+        monkeypatch.setattr(_connections.fcntl, 'fcntl', _dummy_fcntl)
+        monkeypatch.setattr(_connections.fcntl, 'F_GETFD', 1)
+
+    # Use the provided socket or fall back to the fixture
+    actual_client = scenario.client_s or fake_socket
+
+    # Mock the server socket to return our scenario-specific data
+    fake_server_socket = SimpleNamespace(
+        accept=lambda: (actual_client, scenario.provided_addr),
+    )
+
+    if scenario.expect_error:
+        with pytest.raises(OSError, match='Broken'):
+            conn_manager_with_server._from_server_socket(fake_server_socket)
+    else:
+        conn = conn_manager_with_server._from_server_socket(fake_server_socket)
+
+        assert conn is not None
+        assert conn.sock is actual_client
+
+        expected_ip, expected_port = scenario.expected_addr
+        assert conn.remote_addr == expected_ip
+        assert conn.remote_port == expected_port
+        assert conn_manager_with_server.server.stats['Accepts'] == 1
