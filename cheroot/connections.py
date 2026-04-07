@@ -379,6 +379,12 @@ class ConnectionManager:
 
         return s, addr
 
+    def _configure_socket(self, s):
+        """Apply standard settings to a new socket."""
+        prevent_socket_inheritance(s)
+        if hasattr(s, 'settimeout'):
+            s.settimeout(self.server.timeout)
+
     def _from_server_socket(self, server_socket):
         # Accept the raw connection
         result = self._accept_conn(server_socket)
@@ -386,9 +392,7 @@ class ConnectionManager:
             return None
         s, addr = result
 
-        prevent_socket_inheritance(s)
-        if hasattr(s, 'settimeout'):
-            s.settimeout(self.server.timeout)
+        self._configure_socket(s)
 
         # Handle TLS wrap if applicable
         mf = MakeFile
