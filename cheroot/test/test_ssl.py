@@ -500,6 +500,8 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
                     'error(10054, '
                     "'An existing connection was forcibly closed "
                     "by the remote host'))",
+                    "('Connection aborted.', ConnectionResetError(10054, "
+                    "'An existing connection was forcibly closed by the remote host'))",
                 )
                 if IS_WINDOWS
                 else (
