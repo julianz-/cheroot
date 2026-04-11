@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 import traceback
-from collections import namedtuple
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +29,6 @@ from cryptography.hazmat.primitives.serialization import (
 )
 
 from cheroot import (
-    connections as _connections,
     errors,
 )
 from cheroot.connections import ConnectionManager
@@ -1177,73 +1175,42 @@ def conn_manager():
     return mgr
 
 
-def test_ignore_socket_oserror_increments_stats(conn_manager):
-    """Test the socket OSError handler for interrupt errors."""
-    # Simulate an interrupt error
-    exc = OSError(errors.socket_error_eintr[0])
+@pytest.mark.parametrize(
+    ('err_code', 'should_ignore', 'stats_enabled', 'expect_error'),
+    (
+        (errors.socket_error_eintr[0], True, True, True),
+        (errors.socket_errors_nonblocking[0], True, True, True),
+        (errors.socket_errors_to_ignore[0], True, True, True),
+        (999, False, True, True),
+        (errors.socket_error_eintr[0], True, False, False),  # stats disabled
+    ),
+    ids=['eintr', 'nonblocking', 'to-ignore', 'unknown', 'stats-disabled'],
+)
+def test_ignore_socket_oserror(
+    conn_manager,
+    err_code,
+    should_ignore,
+    stats_enabled,
+    expect_error,
+):
+    """OSError handler returns correct result and increments stats appropriately."""
+    conn_manager.server.stats['Enabled'] = stats_enabled
+    exc = OSError(err_code)
 
     result = conn_manager._ignore_socket_oserror(exc)
 
-    assert result is True
-    assert conn_manager.server.stats['Socket Errors'] == 1
-
-
-def test_ignore_socket_oserror_disabled_stats(conn_manager):
-    """Test the socket OSError handler for disabled_stats."""
-    conn_manager.server.stats['Enabled'] = False
-    exc = OSError(errors.socket_error_eintr[0])
-
-    conn_manager._ignore_socket_oserror(exc)
-
-    # Should NOT increment since 'Enabled' is False
-    assert conn_manager.server.stats['Socket Errors'] == 0
-
-
-@pytest.mark.parametrize(
-    ('err_code', 'expected'),
-    (
-        (errors.socket_error_eintr[0], True),
-        (errors.socket_errors_nonblocking[0], True),
-        (errors.socket_errors_to_ignore[0], True),
-        (999, False),
-    ),
-)
-def test_ignore_socket_oserror_logic_branches(
-    conn_manager,
-    err_code,
-    expected,
-):
-    """Test the socket OSError handler for ignorable errors."""
-    exc = OSError(err_code)
-    assert conn_manager._ignore_socket_oserror(exc) is expected
-
-
-def _raise_eintr(*args, **kwargs):
-    """Raise an interrupt error."""
-    raise OSError(errno.EINTR, 'Interrupted system call')
-
-
-def test_from_server_socket_interrupt_error(conn_manager_with_server):
-    """Verify that _from_server_socket returns None on ignorable OS errors."""
-    # Assign that function to 'accept'
-    fake_server_socket = SimpleNamespace(
-        accept=_raise_eintr,
-    )
-
-    # Execute
-    conn = conn_manager_with_server._from_server_socket(fake_server_socket)
-    assert conn is None
+    assert result is should_ignore
+    assert conn_manager.server.stats['Socket Errors'] == expect_error
 
 
 @pytest.fixture
-def conn_manager_with_server():
+def conn_manager_with_server(mocker):
     """Create a ConnectionManager with a stub server."""
     mgr = ConnectionManager.__new__(ConnectionManager)
     mgr.server = SimpleNamespace(
         stats={'Enabled': True, 'Accepts': 0, 'Socket Errors': 0},
         ssl_adapter=None,
         timeout=10,
-        # Explicitly 3 args to match the modern pipeline
         ConnectionClass=lambda server, s, mf: SimpleNamespace(
             server=server,
             sock=s,
@@ -1252,99 +1219,164 @@ def conn_manager_with_server():
             remote_port=None,
         ),
         bind_addr=('127.0.0.1', 8080),
+        close=mocker.Mock(),
     )
     return mgr
 
 
-@pytest.fixture
-def fake_socket():
-    """Provide a basic mock socket."""
+@contextlib.contextmanager
+def pipe_fd():
+    """Open an OS pipe and ensure both ends are closed."""
+    read_fd, write_fd = os.pipe()
+    try:
+        yield read_fd
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def _make_fake_socket(error, read_fd):
+    def _accept():  # noqa: WPS430
+        raise error
+
     return SimpleNamespace(
-        settimeout=lambda t: None,
-        fileno=lambda: 10,
-        close=lambda: None,
-        getsockname=lambda: ('127.0.0.1', 8080),
+        accept=_accept,
+        fileno=lambda: read_fd,
     )
-
-
-def _dummy_fcntl(fd, op, arg=0):
-    """Return nothing instead of a real file control."""
-    return 0
-
-
-def raise_os_error(*args, **kwargs):
-    """Raise OSError in a mock."""
-    raise OSError('Broken')
-
-
-Scenario = namedtuple(
-    'Scenario',
-    ['client_s', 'provided_addr', 'expected_addr', 'expect_error'],
-)
 
 
 @pytest.mark.parametrize(
-    'scenario',
+    ('error', 'expected_exception'),
     (
-        Scenario(None, ('127.0.0.1', 123), ('127.0.0.1', 123), False),
-        Scenario(None, None, ('0.0.0.0', 0), False),
-        Scenario(
-            SimpleNamespace(
-                settimeout=raise_os_error,
-                fileno=lambda: 11,
-                close=lambda: None,
-            ),
-            ('10.0.0.1', 456),
-            ('10.0.0.1', 456),
-            True,
-        ),
+        (socket.timeout(), None),
+        (OSError(errno.EAGAIN, 'Resource temporarily unavailable'), None),
+        (OSError(errno.EINTR, 'Interrupted system call'), None),
+        (OSError(errno.EIO, 'Critical kernel error'), OSError),
     ),
-    ids=(
-        'standard-success',
-        'missing-addr-fallback',
-        'broken-socket-oserror',
-    ),
+    ids=['timeout', 'EAGAIN-ignored', 'EINTR-ignored', 'oserror-critical'],
 )
-def test_from_server_socket_scenarios(
+def test_from_server_socket_transport_errors(
     conn_manager_with_server,
-    fake_socket,
-    monkeypatch,
-    scenario,
+    error,
+    expected_exception,
 ):
-    """
-    Verify high-level connection orchestration from sockets.
+    """Test errors raised during initial socket accept are handled correctly."""
+    with pipe_fd() as read_fd:
+        fake_socket = _make_fake_socket(error, read_fd)
 
-    This test ensures that the ``_from_server_socket()``
-    pipeline correctly:
-    1. Accepts a connection from the server socket.
-    2. Configures the resulting client socket.
-    3. Successfully increments 'Accepts' stats on successful configuration.
-    4. Wraps the socket into a Connection object.
-    """
-    # 1. Neuter fcntl right here inside the function
-    if hasattr(_connections, 'fcntl'):
-        # Patch the function
-        monkeypatch.setattr(_connections.fcntl, 'fcntl', _dummy_fcntl)
-        monkeypatch.setattr(_connections.fcntl, 'F_GETFD', 1)
+        if expected_exception:
+            with pytest.raises(
+                expected_exception,
+                match='Critical kernel error',
+            ):
+                conn_manager_with_server._from_server_socket(fake_socket)
+        else:
+            assert (
+                conn_manager_with_server._from_server_socket(fake_socket)
+                is None
+            )
 
-    # Use the provided socket or fall back to the fixture
-    actual_client = scenario.client_s or fake_socket
 
-    # Mock the server socket to return our scenario-specific data
-    fake_server_socket = SimpleNamespace(
-        accept=lambda: (actual_client, scenario.provided_addr),
+def _make_connection(
+    conn_manager,
+    monkeypatch,
+    provided_addr=('1.2.3.4', 80),
+    sock_name=('127.0.0.1', 80),
+):
+    """Set up a fake listener and call _from_server_socket."""
+    if sys.platform != 'win32':
+        monkeypatch.setattr(
+            'fcntl.fcntl',
+            lambda fd, cmd, *args: 0,
+            raising=False,
+        )
+
+    conn_manager.ConnectionClass = lambda sock, addr, server: SimpleNamespace(
+        sock=sock,
+        server=server,
+    )
+    accepted_socket = SimpleNamespace(
+        fileno=lambda: 10,
+        setblocking=lambda x: None,
+        settimeout=lambda t: None,
+        setsockopt=lambda *a: None,
+        getsockname=lambda: sock_name,
+    )
+    fake_listener = SimpleNamespace(
+        accept=lambda: (accepted_socket, provided_addr),
+    )
+    return conn_manager._from_server_socket(fake_listener)
+
+
+@pytest.mark.parametrize(
+    ('provided_addr', 'sock_name', 'expected_ip', 'expected_port'),
+    (
+        (('1.2.3.4', 80), ('127.0.0.1', 80), '1.2.3.4', 80),
+        (None, ('127.0.0.1', 80), '0.0.0.0', 0),
+        (None, ('::1', 80, 0, 0), '::', 0),
+    ),
+    ids=['explicit-addr', 'ipv4-fallback', 'ipv6-fallback'],
+)
+def test_from_server_socket_address_resolution(
+    conn_manager_with_server,
+    monkeypatch,
+    provided_addr,
+    sock_name,
+    expected_ip,
+    expected_port,
+):  # pylint: disable=too-many-positional-arguments
+    """Remote address is resolved correctly from accepted socket or fallback."""
+    conn = _make_connection(
+        conn_manager_with_server,
+        monkeypatch,
+        provided_addr,
+        sock_name,
+    )
+    assert conn is not None
+    assert conn.remote_addr == expected_ip
+    assert conn.remote_port == expected_port
+
+
+def _fatal_ssl_wrap(sock):
+    raise errors.FatalSSLAlert('Simulated handshake drop')
+
+
+def test_from_server_socket_ssl_failure(conn_manager_with_server, monkeypatch):
+    """A FatalSSLAlert during TLS wrap closes the connection and logs it."""
+    server = conn_manager_with_server.server
+    monkeypatch.setattr(
+        server,
+        'ssl_adapter',
+        SimpleNamespace(wrap=_fatal_ssl_wrap),
     )
 
-    if scenario.expect_error:
-        with pytest.raises(OSError, match='Broken'):
-            conn_manager_with_server._from_server_socket(fake_server_socket)
-    else:
-        conn = conn_manager_with_server._from_server_socket(fake_server_socket)
+    logged_messages = []
+    server.error_log = lambda msg, **kwargs: logged_messages.append(msg)
 
-        assert conn is not None
-        assert conn.sock is actual_client
+    conn = _make_connection(conn_manager_with_server, monkeypatch)
+    assert conn is None
+    assert any('lost' in msg.lower() for msg in logged_messages)
 
-        expected_ip, expected_port = scenario.expected_addr
-        assert conn.remote_addr == expected_ip
-        assert conn.remote_port == expected_port
-        assert conn_manager_with_server.server.stats['Accepts'] == 1
+
+def test_connection_manager_close_logic(conn_manager_with_server, mocker):
+    """Verify close() shuts down client connections but not server."""
+    mgr = conn_manager_with_server
+
+    mock_conn_1 = mocker.Mock()
+    mock_conn_2 = mocker.Mock()
+
+    selector = mocker.Mock()
+    selector.connections = [
+        (None, mock_conn_1),
+        (None, mock_conn_2),
+        (None, mgr.server),
+    ]
+
+    mgr._selector = selector
+    mgr.close()
+
+    mock_conn_1.close.assert_called_once()
+    mock_conn_2.close.assert_called_once()
+    # Server is excluded from close() — only client connections are closed
+    mgr.server.close.assert_not_called()
+    selector.close.assert_called_once()
