@@ -1186,18 +1186,18 @@ def conn_manager():
     ),
     ids=['eintr', 'nonblocking', 'to-ignore', 'unknown', 'stats-disabled'],
 )
-def test_ignore_socket_oserror(
+def test_is_ignorable_socket_error(
     conn_manager,
     err_code,
     should_ignore,
     stats_enabled,
     expect_error,
 ):
-    """OSError handler returns correct result and increments stats appropriately."""
+    """_is_ignorable_socket_error correctly classifies errors and tracks them in stats."""
     conn_manager.server.stats['Enabled'] = stats_enabled
     exc = OSError(err_code)
 
-    result = conn_manager._ignore_socket_oserror(exc)
+    result = conn_manager._is_ignorable_socket_error(exc)
 
     assert result is should_ignore
     assert conn_manager.server.stats['Socket Errors'] == expect_error

@@ -316,8 +316,8 @@ class ConnectionManager:
         conn.remote_addr = addr[0]
         conn.remote_port = addr[1]
 
-    def _ignore_socket_oserror(self, exc):
-        """Determine if an OSError during socket operations should be ignored."""
+    def _is_ignorable_socket_error(self, exc, /):
+        """Return True if an OSError during socket operations can be ignored."""
         if self.server.stats['Enabled']:
             self.server.stats['Socket Errors'] += 1
         err_code = exc.args[0]
@@ -369,7 +369,7 @@ class ConnectionManager:
         except socket.timeout:
             return None
         except OSError as exc:
-            if self._ignore_socket_oserror(exc):
+            if self._is_ignorable_socket_error(exc):
                 return None
             raise
 
