@@ -299,7 +299,7 @@ class ConnectionManager:
             with _cm.suppress(OSError):
                 conn.close()
 
-    def _setup_conn_addr(self, conn, sock, addr):
+    def _setup_conn_addr(self, conn, sock, addr, /):
         """Configure remote address and port for the connection.
 
         Populates the connection object with remote address metadata.
@@ -369,7 +369,7 @@ class ConnectionManager:
     def _accept_conn(self, server_socket):
         """Accept the connection."""
         try:
-            s, addr = server_socket.accept()
+            sock, addr = server_socket.accept()
         except socket.timeout:
             return None
         except OSError as exc:
@@ -380,7 +380,7 @@ class ConnectionManager:
         if self.server.stats['Enabled']:
             self.server.stats['Accepts'] += 1
 
-        return s, addr
+        return sock, addr
 
     def _configure_socket(self, sock):
         """Apply standard settings to a new socket."""
