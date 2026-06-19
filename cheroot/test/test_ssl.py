@@ -1301,6 +1301,7 @@ def _make_connection(
         settimeout=lambda t: None,
         setsockopt=lambda *a: None,
         getsockname=lambda: sock_name,
+        close=lambda: None,
     )
     fake_listener = SimpleNamespace(
         accept=lambda: (accepted_socket, provided_addr),

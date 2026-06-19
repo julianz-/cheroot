@@ -348,7 +348,6 @@ class ConnectionManager:
                 'connection suddenly, during handshake: '
                 f'{tls_connection_drop_error!s}',
             )
-            return None, {}
         except errors.NoSSLError as http_over_https_err:
             self.server.error_log(
                 f'Client {addr!s} attempted to speak plain HTTP into '
