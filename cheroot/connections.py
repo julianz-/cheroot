@@ -123,6 +123,10 @@ def _suppress_socket_io_errors(socket, /):
             raise
 
 
+class _NoConnectionAvailable(Exception):
+    """Raised when no connection is ready to be accepted."""
+
+
 class ConnectionManager:
     """Class which manages HTTPConnection objects.
 
@@ -295,7 +299,7 @@ class ConnectionManager:
             with _cm.suppress(OSError):
                 conn.close()
 
-    def _setup_conn_addr(self, conn, s, addr):
+    def _setup_conn_addr(self, conn, sock, addr):
         """Configure remote address and port for the connection.
 
         Populates the connection object with remote address metadata.
@@ -307,7 +311,7 @@ class ConnectionManager:
         # Until we do DNS lookups, omit REMOTE_HOST
         if addr is None:  # sometimes this can happen
             # figure out if AF_INET or AF_INET6.
-            if len(s.getsockname()) == 2:
+            if len(sock.getsockname()) == 2:
                 # AF_INET
                 addr = ('0.0.0.0', 0)
             else:
@@ -337,8 +341,8 @@ class ConnectionManager:
     def _wrap_socket_for_tls(self, raw_socket, addr):
         """Handle the TLS wrap and log specific error responses.
 
-        on success returns e.g. (SSLSocket, {'SSL_PROTOCOL': 'TLSv1.3', ...}).
-        on failure returns None, {}
+        On success returns e.g. (SSLSocket, {'SSL_PROTOCOL': 'TLSv1.3', ...}).
+        On failure closes the socket and raises ConnectionError.
         """
         try:
             return self.server.ssl_adapter.wrap(raw_socket)
@@ -360,7 +364,7 @@ class ConnectionManager:
         # If we hit either exception, close the socket and signal failure
         with _cm.suppress(OSError):
             raw_socket.close()
-        return None, {}
+        raise ConnectionError
 
     def _accept_conn(self, server_socket):
         """Accept the connection."""
@@ -378,49 +382,54 @@ class ConnectionManager:
 
         return s, addr
 
-    def _configure_socket(self, s):
+    def _configure_socket(self, sock):
         """Apply standard settings to a new socket."""
-        prevent_socket_inheritance(s)
-        if hasattr(s, 'settimeout'):
-            s.settimeout(self.server.timeout)
+        prevent_socket_inheritance(sock)
+        if hasattr(sock, 'settimeout'):
+            sock.settimeout(self.server.timeout)
 
     def _prepare_socket(self, server_socket):
-        """Handle physical accept and TLS negotiation."""
+        """Handle physical accept and TLS negotiation.
+
+        Returns (sock, addr, makefile, ssl_env) where sock is the accepted
+        socket (possibly TLS-wrapped), addr is the remote (ip, port), makefile
+        is a callable that wraps the socket for buffered reading, and ssl_env
+        is a dict of TLS metadata (empty if not using TLS).
+        Raises _NoConnectionAvailable if no connection is ready to accept.
+        Raises ConnectionError if TLS negotiation fails.
+        """
         result = self._accept_conn(server_socket)
         if result is None:
-            return None, None, None, None
-        s, addr = result
+            raise _NoConnectionAvailable
+        sock, addr = result
 
-        self._configure_socket(s)
+        self._configure_socket(sock)
 
-        mf = MakeFile
+        makefile = MakeFile
         ssl_env = {}
 
         if self.server.ssl_adapter is not None:
-            s, ssl_env = self._wrap_socket_for_tls(s, addr)
-            if not s:
-                return None, None, None, None
-
-            mf = self.server.ssl_adapter.makefile
+            sock, ssl_env = self._wrap_socket_for_tls(sock, addr)
+            makefile = self.server.ssl_adapter.makefile
             # Re-apply our timeout since we may have a new socket object
-            if hasattr(s, 'settimeout'):
-                s.settimeout(self.server.timeout)
+            if hasattr(sock, 'settimeout'):
+                sock.settimeout(self.server.timeout)
 
-        return s, addr, mf, ssl_env
+        return sock, addr, makefile, ssl_env
 
     def _from_server_socket(self, server_socket):
         """Orchestrate the creation of a connection from a server socket."""
-        # Handle the connection acceptance and the TLS wrapping if applicable
-        s, addr, mf, ssl_env = self._prepare_socket(server_socket)
-        if s is None:
+        try:
+            sock, addr, makefile, ssl_env = self._prepare_socket(server_socket)
+        except (_NoConnectionAvailable, ConnectionError):
             return None
 
         # Initialize the Connection object
-        conn = self.server.ConnectionClass(self.server, s, mf)
+        conn = self.server.ConnectionClass(self.server, sock, makefile)
         conn.ssl_env = ssl_env
 
         if not isinstance(self.server.bind_addr, (str, bytes)):
-            self._setup_conn_addr(conn, s, addr)
+            self._setup_conn_addr(conn, sock, addr)
 
         return conn
 
