@@ -370,6 +370,7 @@ class ConnectionManager:
         """Accept the connection."""
         try:
             sock, addr = server_socket.accept()
+        # socket.timeout: OSError subclass (3.3+), TimeoutError alias (3.10+)
         except socket.timeout:
             return None
         except OSError as exc:
