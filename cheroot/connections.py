@@ -392,12 +392,11 @@ class ConnectionManager:
     def _prepare_socket(self, server_socket):
         """Handle physical accept and TLS negotiation.
 
-        Returns (sock, addr, makefile, ssl_env) where sock is the accepted
-        socket (possibly TLS-wrapped), addr is the remote (ip, port), makefile
-        is a callable that wraps the socket for buffered reading, and ssl_env
-        is a dict of TLS metadata (empty if not using TLS).
-        Raises _NoConnectionAvailable if no connection is ready to accept.
-        Raises ConnectionError if TLS negotiation fails.
+        Returns a 4-tuple of the accepted socket (possibly TLS-wrapped),
+        the remote address and port, a callable that wraps the socket for
+        buffered reading, and a dict of TLS metadata (empty if not using TLS).
+        Raises ``_NoConnectionAvailable`` if no connection is ready to accept.
+        Raises ``ConnectionError`` if TLS negotiation fails.
         """
         result = self._accept_conn(server_socket)
         if result is None:
