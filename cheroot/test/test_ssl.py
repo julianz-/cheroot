@@ -1250,7 +1250,8 @@ def _make_fake_socket(error, read_fd):
     (
         (socket.timeout(), None),
         (OSError(errno.EAGAIN, 'Resource temporarily unavailable'), None),
-        (OSError(errno.EINTR, 'Interrupted system call'), None),
+        # InterruptedError is an OSError subclass raised by Python for EINTR
+        (InterruptedError(errno.EINTR, 'Interrupted system call'), None),
         (OSError(errno.EIO, 'Critical kernel error'), OSError),
     ),
     ids=['timeout', 'EAGAIN-ignored', 'EINTR-ignored', 'oserror-critical'],
