@@ -1224,25 +1224,11 @@ def conn_manager_with_server(mocker):
     return mgr
 
 
-@contextlib.contextmanager
-def pipe_fd():
-    """Open an OS pipe and ensure both ends are closed."""
-    read_fd, write_fd = os.pipe()
-    try:
-        yield read_fd
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
-
-
-def _make_fake_socket(error, read_fd):
+def _make_fake_socket(error):
     def _accept():  # noqa: WPS430
         raise error
 
-    return SimpleNamespace(
-        accept=_accept,
-        fileno=lambda: read_fd,
-    )
+    return SimpleNamespace(accept=_accept)
 
 
 @pytest.mark.parametrize(
@@ -1262,20 +1248,19 @@ def test_from_server_socket_transport_errors(
     expected_exception,
 ):
     """Test errors raised during initial socket accept are handled correctly."""
-    with pipe_fd() as read_fd:
-        fake_socket = _make_fake_socket(error, read_fd)
+    fake_socket = _make_fake_socket(error)
 
-        if expected_exception:
-            with pytest.raises(
-                expected_exception,
-                match='Critical kernel error',
-            ):
-                conn_manager_with_server._from_server_socket(fake_socket)
-        else:
-            assert (
-                conn_manager_with_server._from_server_socket(fake_socket)
-                is None
-            )
+    if expected_exception:
+        with pytest.raises(
+            expected_exception,
+            match='Critical kernel error',
+        ):
+            conn_manager_with_server._from_server_socket(fake_socket)
+    else:
+        assert (
+            conn_manager_with_server._from_server_socket(fake_socket)
+            is None
+        )
 
 
 def _make_connection(
