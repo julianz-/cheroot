@@ -1258,8 +1258,7 @@ def test_from_server_socket_transport_errors(
             conn_manager_with_server._from_server_socket(fake_socket)
     else:
         assert (
-            conn_manager_with_server._from_server_socket(fake_socket)
-            is None
+            conn_manager_with_server._from_server_socket(fake_socket) is None
         )
 
 
