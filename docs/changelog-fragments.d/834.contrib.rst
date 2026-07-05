@@ -1,0 +1,4 @@
+Updated the pull request template with consistent heading structure,
+a change log entry checkbox linking to the change log guidelines,
+and improved commit message guidance
+-- by :user:`julianz-`.
