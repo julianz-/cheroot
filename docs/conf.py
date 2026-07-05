@@ -35,6 +35,7 @@ extensions = [
     'sphinx.ext.intersphinx',
     # Third-party extensions:
     'jaraco.packaging.sphinx',
+    'myst_parser',  # extended markdown; https://pypi.org/p/myst-parser
     'sphinx_issues',  # implements `:issue:`, `:pr:` and other GH-related roles
     'sphinx_tabs.tabs',
     'sphinxcontrib.apidoc',
