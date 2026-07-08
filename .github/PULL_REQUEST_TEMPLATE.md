@@ -45,7 +45,7 @@ entertain early in the review process. Thank you in advance!
 <!-- It's fine to open a draft and tick more boxes before marking ready for review. -->
 
 > [!tip]
-> New to open source contributions? [Making a lovely PR][making a lovely PR] is a great read.
+> New to open source contributions? [Making a lovely PR] is a great read.
 
 * [ ] I wrote descriptive pull request text above
 * [ ] The PR relates to *only* one subject with a clear title
@@ -57,19 +57,20 @@ entertain early in the review process. Thank you in advance!
 * [ ] The new code doesn't generate linter offenses
 * [ ] Project documentation (in `docs/`) and inline docstrings reflect the changes
 * [ ] My commits each have a descriptive title and a body explaining the why
-      (see [guide][good commit messages])
+      (see [good commit messages])
 * [ ] I have added a [change log entry]
-      (can be done once the PR number is known)
-* [ ] I'm planning to [squash related commits together][related squash]
-      before final merge
-* [ ] I have read the [contribution guide][CONTRIBUTING] and the
+      (can be done once the PR number is known; alternatively, you can
+      use a related issue number if one exists)
+* [ ] I'm planning to [squash related commits] together before final merge
+* [ ] I have read the [contribution guide] and the
       [code of conduct][CoC]
 
-[CONTRIBUTING]: https://cheroot.cherrypy.dev/en/latest/contributing/guidelines/
+[contribution guide]:
+https://cheroot.cherrypy.dev/en/latest/contributing/guidelines/
 [CoC]: https://github.com/cherrypy/cheroot?tab=coc-ov-file#readme
 [change log entry]:
 https://github.com/cherrypy/cheroot/tree/main/docs/changelog-fragments.d#readme
 [good commit messages]: http://chris.beams.io/posts/git-commit/
-[making a lovely PR]: https://mtlynch.io/code-review-love/
-[related squash]:
+[Making a lovely PR]: https://mtlynch.io/code-review-love/
+[squash related commits]:
 https://github.com/todotxt/todo.txt-android/wiki/Squash-All-Commits-Related-to-a-Single-Issue-into-a-Single-Commit
