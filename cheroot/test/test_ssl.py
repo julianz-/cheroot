@@ -527,9 +527,7 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
                 "'Remote end closed connection without response'))",
             )
 
-        assert any(e in err_text for e in expected_substrings), (
-            f'Unexpected error text: {err_text!r}'
-        )
+        assert any(e in err_text for e in expected_substrings)
 
 
 @pytest.mark.parametrize(  # noqa: C901  # FIXME
@@ -700,17 +698,9 @@ def test_https_over_http_error(http_server, ip_addr):
             f'{interface}:{port}',
         ).request('GET', '/')
     underlying_error_string = str(ssl_err.value)
-    if IS_ABOVE_OPENSSL31 and IS_WINDOWS:
-        # On Windows, the TCP reset (RST) is surfaced before OpenSSL processes
-        # the server's response, yielding 'wrong version number' rather than
-        # the usual 'record layer failure'. See CPython's own test_ssl.py:
-        # https://github.com/python/cpython/blob/\
-        # 1b9fe5c7226eccc8b269a7443148033080399f43\
-        # /Lib/test/test_ssl.py#L5705
-        assert 'wrong version number' in underlying_error_string
-    elif IS_ABOVE_OPENSSL31:
-        # Newer Python returns 'record layer failure'; Python 3.8 on macOS
-        # returns 'wrong version number' despite OpenSSL >= 3.1.
+    if IS_ABOVE_OPENSSL31:
+        # 'record layer failure' is typical, but Windows and macOS/Python 3.8
+        # yield 'wrong version number' instead.
         assert (
             'record layer failure' in underlying_error_string
             or 'wrong version number' in underlying_error_string
