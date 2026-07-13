@@ -15,7 +15,7 @@ Welcome to Cheroot documentation!
    :hidden:
 
    contributing/guidelines
-   contributing/code_of_conduct
+   Code of Conduct <contributing/code_of_conduct>
 
 .. toctree::
    :caption: Maintenance
