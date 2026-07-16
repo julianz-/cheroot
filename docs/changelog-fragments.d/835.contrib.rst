@@ -1,0 +1,3 @@
+Added :pypi:`myst-parser` to enable Markdown support in Sphinx documentation,
+and linked the :doc:`Code of Conduct <contributing/code_of_conduct>` in the docs sidebar
+-- by :user:`julianz-`.
