@@ -697,14 +697,18 @@ def test_https_over_http_error(http_server, ip_addr):
         http.client.HTTPSConnection(
             f'{interface}:{port}',
         ).request('GET', '/')
-    expected_substring = (
-        'record layer failure'
-        if IS_ABOVE_OPENSSL31
-        else 'wrong version number'
-        if IS_ABOVE_OPENSSL10
-        else 'unknown protocol'
-    )
-    assert expected_substring in ssl_err.value.args[-1]
+    underlying_error_string = str(ssl_err.value)
+    if IS_ABOVE_OPENSSL31:
+        # 'record layer failure' is typical, but Windows and macOS/Python 3.8
+        # yield 'wrong version number' instead.
+        assert (
+            'record layer failure' in underlying_error_string
+            or 'wrong version number' in underlying_error_string
+        )
+    elif IS_ABOVE_OPENSSL10:
+        assert 'wrong version number' in underlying_error_string
+    else:  # pragma: no cover
+        assert 'unknown protocol' in underlying_error_string
 
 
 def test_http_over_https_no_data(mocker):
