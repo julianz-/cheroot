@@ -1,0 +1,5 @@
+Documented the pull request template requirement in ``.github/CONTRIBUTING.rst``,
+including guidance for automated and AI-assisted tools that submit PRs via the
+GitHub API, and replaced the outdated CherryPy contributing link with cheroot's
+own contribution guidelines
+-- by :user:`julianz-`.
