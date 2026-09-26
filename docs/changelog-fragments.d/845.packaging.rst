@@ -1,0 +1,6 @@
+Excluded the PyPy 3.11 job on the Linux ARM64 CI runner: that runner has
+no cached PyPy 7.3.23 build and downloads the newly released PyPy 8.0.0
+instead, which has a CFFI buffer-export bug that breaks reading TLS
+streams to EOF and crashes cheroot's SSL adapter tests.
+
+-- by :user:`julianz-`

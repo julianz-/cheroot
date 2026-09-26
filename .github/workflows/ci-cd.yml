@@ -765,6 +765,15 @@ jobs:
           python-version: pypy-3.11
         - runner-vm-os: macos-15-intel
           python-version: pypy-3.11
+        # NOTE: Linux ARM64 PyPy 3.11 jobs are excluded because, unlike on
+        # NOTE: ubuntu-24.04/ubuntu-22.04, that runner image has no cached
+        # NOTE: PyPy 7.3.23 build and downloads the newly released PyPy
+        # NOTE: 8.0.0 instead, which has a CFFI buffer-export bug that
+        # NOTE: breaks reading TLS streams to EOF.
+        # NOTE: Ref: https://github.com/pypy/pypy/issues/5589
+        # NOTE: They should be re-added once it's fixed.
+        - runner-vm-os: ubuntu-24.04-arm
+          python-version: pypy-3.11
 
     uses: tox-dev/workflow/.github/workflows/reusable-tox.yml@1bb961580e20073f66ccb9024f248357f8c8fecb  # yamllint disable-line rule:line-length
     with:
