@@ -1,0 +1,6 @@
+Pinned the ``coverage`` core to ``ctrace`` in test runs, avoiding a
+``CoverageWarning`` that ``coveragepy`` 7.15.3+ raises for dynamic
+contexts under the newer ``sysmon`` core -- treated as a hard error
+here since warnings are configured to fail the test suite.
+
+-- by :user:`julianz-`
