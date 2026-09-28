@@ -490,6 +490,12 @@ def test_tls_client_auth(  # noqa: C901, WPS213  # FIXME
                     'ConnectionResetError(10054, '
                     "'An existing connection was forcibly closed "
                     "by the remote host', None, 10054, None))",
+                    # NOTE: seen on `windows-2025` without the trailing
+                    # NOTE: `None, 10054, None` args in the repr above.
+                    "('Connection aborted.', "
+                    'ConnectionResetError(10054, '
+                    "'An existing connection was forcibly closed "
+                    "by the remote host'))",
                     "('Connection aborted.', "
                     'error(10054, '
                     "'An existing connection was forcibly closed "

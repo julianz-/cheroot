@@ -1,0 +1,6 @@
+Added a new expected connection-reset error message variant to
+``test_tls_client_auth`` on Windows, without the trailing ``None, 10054,
+None`` ``args`` seen in older ``ConnectionResetError`` ``reprs``, fixing
+a test flake seen on the ``windows-2025`` CI runner.
+
+-- by :user:`julianz-`
